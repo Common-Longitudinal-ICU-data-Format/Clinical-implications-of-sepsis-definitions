@@ -131,7 +131,7 @@ def _(DATA_DIR, FILETYPE, RespiratorySupport, TIMEZONE, hosp_ids):
         timezone=TIMEZONE,
         filters={
             'hospitalization_id': hosp_ids,
-            'device_category': ['IMV', 'NIPPV', 'High_Flow_NC']
+            'device_category': ['IMV', 'NIPPV', 'High Flow NC']
         }
     )
     print(f"Respiratory support: {len(resp.df):,} rows")
@@ -287,13 +287,7 @@ def _(hosp_ids, pd, resp):
     resp_df['had_hfno'] = resp_df['hospitalization_id'].isin(hosp_hfno)
 
     print(f"Respiratory: IMV={resp_df['had_imv'].sum():,}, NIPPV={resp_df['had_nippv'].sum():,}, HFNO={resp_df['had_hfno'].sum():,}")
-    return resp_df, resp_raw
-
-
-@app.cell
-def _(resp_raw):
-    resp_raw.device_category.value_counts()
-    return
+    return (resp_df,)
 
 
 @app.cell
