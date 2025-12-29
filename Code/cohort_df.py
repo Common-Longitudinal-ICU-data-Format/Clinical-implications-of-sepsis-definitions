@@ -1,0 +1,331 @@
+import marimo
+
+__generated_with = "0.18.4"
+app = marimo.App(width="medium")
+
+
+@app.cell
+def _():
+    import marimo as mo
+    return (mo,)
+
+
+@app.cell
+def _(mo):
+    mo.md(r"""
+    # Sepsis Definitions Cohort Identification
+
+    This notebook builds the cohort for the sepsis definitions comparison study (ASE with/without lactate vs BSE).
+
+    ## Inclusion Criteria
+    - Adult hospitalized patients aged 18 years or older
+    - Admitted 2018-2024
+    - Admitted via the ED
+    - Admitted to academic or community hospitals (excluding LTACH)
+    - Must have both ED and ICU locations during hospitalization
+    """)
+    return
+
+
+@app.cell
+def _():
+    import importlib
+    import json
+    import pandas as pd
+    from pathlib import Path
+    from clifpy.tables import Patient, Hospitalization, Adt
+    return Adt, Hospitalization, Path, Patient, importlib, json, pd
+
+
+@app.cell
+def _(Path, json):
+    # Load configuration (run notebook from project root)
+    config_path = Path("clif_config.json")
+    with open(config_path, "r") as f:
+        config = json.load(f)
+
+    DATA_DIR = config["data_directory"]
+    FILETYPE = config["filetype"]
+    TIMEZONE = config["timezone"]
+    OUTPUT_DIR = Path(config["output_directory"])
+    SITE_NAME = config["site_name"]
+
+    print(f"Site: {SITE_NAME}")
+    print(f"Data directory: {DATA_DIR}")
+    print(f"Filetype: {FILETYPE}")
+    print(f"Timezone: {TIMEZONE}")
+    return DATA_DIR, FILETYPE, OUTPUT_DIR, SITE_NAME, TIMEZONE
+
+
+@app.cell
+def _(mo):
+    mo.md(r"""
+    ## Step 1: Load Core Tables
+    """)
+    return
+
+
+@app.cell
+def _(Adt, DATA_DIR, FILETYPE, Hospitalization, Patient, TIMEZONE):
+    # Load patient, hospitalization, and adt tables
+    patient = Patient.from_file(
+        data_directory=DATA_DIR,
+        filetype=FILETYPE,
+        timezone=TIMEZONE
+    )
+
+    hospitalization = Hospitalization.from_file(
+        data_directory=DATA_DIR,
+        filetype=FILETYPE,
+        timezone=TIMEZONE
+    )
+
+    adt = Adt.from_file(
+        data_directory=DATA_DIR,
+        filetype=FILETYPE,
+        timezone=TIMEZONE
+    )
+
+    print(f"Patient: {len(patient.df):,} rows")
+    print(f"Hospitalization: {len(hospitalization.df):,} rows")
+    print(f"ADT: {len(adt.df):,} rows")
+    return adt, hospitalization, patient
+
+
+@app.cell
+def _(mo):
+    mo.md(r"""
+    ## Step 2: Apply Inclusion Criteria
+    """)
+    return
+
+
+@app.cell
+def _(adt, hospitalization, pd):
+    # Get dataframes
+    hosp_df = hospitalization.df.copy()
+    adt_df = adt.df.copy()
+
+    # Merge hospitalization and ADT to get hospital_type
+    merged_df = pd.merge(
+        hosp_df,
+        adt_df[["hospitalization_id", "hospital_id", "hospital_type", "in_dttm", "location_category"]].drop_duplicates(),
+        on="hospitalization_id",
+        how="inner"
+    )
+
+    print(f"Total hospitalizations after merge: {merged_df['hospitalization_id'].nunique():,}")
+    return (merged_df,)
+
+
+@app.cell
+def _(merged_df):
+    # Filter 1: Adults (age >= 18)
+    cohort_df = merged_df[
+        (merged_df["age_at_admission"] >= 18) &
+        (merged_df["age_at_admission"].notna())
+    ].copy()
+
+    print(f"After age filter (>=18): {cohort_df['hospitalization_id'].nunique():,} hospitalizations")
+    return (cohort_df,)
+
+
+@app.cell
+def _(cohort_df):
+    # Filter 2: Date range 2018-2024
+    cohort_df_filtered = cohort_df[
+        (cohort_df["admission_dttm"].dt.year >= 2018) &
+        (cohort_df["admission_dttm"].dt.year <= 2024)
+    ].copy()
+
+    print(f"After date filter (2018-2024): {cohort_df_filtered['hospitalization_id'].nunique():,} hospitalizations")
+    return (cohort_df_filtered,)
+
+
+@app.cell
+def _(cohort_df_filtered):
+    # Filter 3: Admitted via ED
+    cohort_df_ed = cohort_df_filtered[
+        cohort_df_filtered["admission_type_category"] == "ed"
+    ].copy()
+
+    print(f"After ED admission filter: {cohort_df_ed['hospitalization_id'].nunique():,} hospitalizations")
+    return (cohort_df_ed,)
+
+
+@app.cell
+def _(cohort_df_ed):
+    # Filter 4: Academic or community hospitals (exclude LTACH)
+    cohort_df_hospital = cohort_df_ed[
+        cohort_df_ed["hospital_type"].isin(["academic", "community"])
+    ].copy()
+
+    print(f"After hospital type filter (academic/community): {cohort_df_hospital['hospitalization_id'].nunique():,} hospitalizations")
+    return (cohort_df_hospital,)
+
+
+@app.cell
+def _(adt, cohort_df_hospital):
+    # Filter 5: Must have both ED and ICU locations during hospitalization
+    # Get hospitalizations with ED location
+    hosp_with_ed = set(adt.df[adt.df["location_category"] == "ed"]["hospitalization_id"].unique())
+
+    # Get hospitalizations with ICU location
+    hosp_with_icu = set(adt.df[adt.df["location_category"] == "icu"]["hospitalization_id"].unique())
+
+    # Require both ED and ICU
+    hosp_with_ed_and_icu = hosp_with_ed & hosp_with_icu
+
+    cohort_df_ed_icu = cohort_df_hospital[
+        cohort_df_hospital["hospitalization_id"].isin(hosp_with_ed_and_icu)
+    ].copy()
+
+    print(f"After ED+ICU location filter: {cohort_df_ed_icu['hospitalization_id'].nunique():,} hospitalizations")
+    return (cohort_df_ed_icu,)
+
+
+@app.cell
+def _(mo):
+    mo.md(r"""
+    ## Step 3: Build Final Cohort with Demographics
+    """)
+    return
+
+
+@app.cell
+def _(cohort_df_ed_icu, patient, pd):
+    # Build final cohort with one row per hospitalization
+    final_cohort = cohort_df_ed_icu.drop_duplicates(subset=["hospitalization_id"]).copy()
+
+    # Add patient demographics
+    patient_df = patient.df[["patient_id", "death_dttm", "race_category", "sex_category", "ethnicity_category"]]
+    final_cohort = pd.merge(final_cohort, patient_df, on="patient_id", how="left")
+
+    print("Final Cohort Summary:")
+    print(f"  Hospitalizations: {final_cohort['hospitalization_id'].nunique():,}")
+    print(f"  Unique patients: {final_cohort['patient_id'].nunique():,}")
+    return (final_cohort,)
+
+
+@app.cell
+def _(final_cohort):
+    # Display cohort demographics
+    print("Demographics:")
+    print(f"  Age: mean={final_cohort['age_at_admission'].mean():.1f}, median={final_cohort['age_at_admission'].median():.1f}")
+    print("Sex distribution:")
+    print(final_cohort["sex_category"].value_counts())
+    print("Hospital type distribution:")
+    print(final_cohort["hospital_type"].value_counts())
+    return
+
+
+@app.cell
+def _(mo):
+    mo.md(r"""
+    ## Step 4: Save Cohort to Parquet
+    """)
+    return
+
+
+@app.cell
+def _(OUTPUT_DIR, SITE_NAME, final_cohort):
+    # Create output directory
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Save cohort
+    cohort_output_path = OUTPUT_DIR / f"{SITE_NAME}_cohort_df.parquet"
+    final_cohort.to_parquet(cohort_output_path, index=False)
+
+    print(f"Cohort saved to: {cohort_output_path}")
+    print(f"Shape: {final_cohort.shape}")
+    return
+
+
+@app.cell
+def _(final_cohort):
+    # Display final cohort
+    final_cohort.head(10)
+    return
+
+
+@app.cell
+def _(mo):
+    mo.md(r"""
+    ## Step 5: Calculate Adult Sepsis Event (ASE)
+    """)
+    return
+
+
+@app.cell
+def _(importlib):
+    # Import ASE module
+    import ASE
+    importlib.reload(ASE)
+    return (ASE,)
+
+
+@app.cell
+def _(ASE, final_cohort):
+    # Get hospitalization IDs from cohort
+    hosp_ids = final_cohort["hospitalization_id"].astype(str).unique().tolist()
+    print(f"Running ASE calculation on {len(hosp_ids):,} hospitalizations...")
+
+    # Calculate ASE
+    ase_results_all = ASE.calculate_ase(
+        hospitalization_ids=hosp_ids,
+        config_path="clif_config.json",
+        verbose=True
+    )
+
+    # Keep only first (index) ASE episode per hospitalization
+    ase_results = ase_results_all[ase_results_all["episode_id"] == 1].copy()
+    print(f"Filtered to first episode: {len(ase_results):,} hospitalizations (from {len(ase_results_all):,} total episodes)")
+    return (ase_results,)
+
+
+@app.cell
+def _(ase_results):
+    # Display ASE summary
+    print("ASE Results Summary:")
+    print(f"  Total episodes: {len(ase_results):,}")
+    print(f"  Presumed infection: {ase_results['presumed_infection'].sum():,}")
+    print(f"  ASE (sepsis): {ase_results['sepsis'].sum():,}")
+    if "type" in ase_results.columns:
+        print(f"  Community-onset: {(ase_results['type'] == 'community').sum():,}")
+        print(f"  Hospital-onset: {(ase_results['type'] == 'hospital').sum():,}")
+    return
+
+
+@app.cell
+def _(mo):
+    mo.md(r"""
+    ## Step 6: Save ASE Results to Parquet
+    """)
+    return
+
+
+@app.cell
+def _(OUTPUT_DIR, SITE_NAME, ase_results):
+    # Save ASE results
+    ase_output_path = OUTPUT_DIR / f"{SITE_NAME}_ase_results.parquet"
+    ase_results.to_parquet(ase_output_path, index=False)
+
+    print(f"ASE results saved to: {ase_output_path}")
+    print(f"Shape: {ase_results.shape}")
+    return
+
+
+@app.cell
+def _(ase_results):
+    # Display ASE results
+    ase_results
+    return
+
+
+@app.cell
+def _():
+    return
+
+
+if __name__ == "__main__":
+    app.run()

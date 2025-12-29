@@ -1,0 +1,7 @@
+{
+  "site_name": "<YOUR_SITE_NAME>",
+  "data_directory": "/path/to/your/clif/tables",
+  "filetype": "parquet",
+  "timezone": "America/Chicago",
+  "output_directory": "./output"
+}

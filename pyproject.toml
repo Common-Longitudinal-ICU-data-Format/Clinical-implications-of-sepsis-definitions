@@ -1,0 +1,13 @@
+[project]
+name = "clinical-implications-of-sepsis-definitions"
+version = "0.1.0"
+description = "Add your description here"
+requires-python = ">=3.13"
+dependencies = [
+    "clifpy>=0.3.4",
+    "duckdb>=1.4.3",
+    "marimo>=0.18.4",
+    "numpy>=2.4.0",
+    "pandas>=2.3.3",
+    "pyarrow>=22.0.0",
+]
