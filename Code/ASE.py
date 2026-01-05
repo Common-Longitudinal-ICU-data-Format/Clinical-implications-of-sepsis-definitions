@@ -1189,6 +1189,7 @@ def _calculate_final_ase(
         "bc_id",
         "presumed_infection",
         "sepsis",
+        "sepsis_wo_lactate",
         "type",
         "no_sepsis_reason",
         "blood_culture_dttm",
@@ -1255,10 +1256,10 @@ def _apply_rit_post_processing(
         "RIT therefore only applies to determination of hospital-onset events."
 
     This function:
-    1. Filters to confirmed ASE cases only (sepsis=1)
-    2. Sorts ASE events by onset date within each hospitalization
-    3. Removes ASE events that occur within 14 days of a previous ASE onset
-    4. Assigns sequential episode_id (1, 2, 3...) to remaining ASE events
+    1. Separates ASE cases (sepsis=1) from non-ASE blood cultures
+    2. Applies RIT to ASE cases only
+    3. Assigns episode_id to ASE cases, NA to non-ASE cases
+    4. Returns ALL blood cultures (both ASE and non-ASE)
 
     Parameters
     ----------
@@ -1270,20 +1271,30 @@ def _apply_rit_post_processing(
     Returns
     -------
     pd.DataFrame
-        Filtered DataFrame containing only ASE events (sepsis=1) with:
-        - episode_id: Sequential ID (1, 2, 3...) per hospitalization after RIT
+        DataFrame containing ALL blood cultures with:
+        - episode_id: Sequential ID (1, 2, 3...) for ASE cases, NA for non-ASE
         - bc_id: Original blood culture ID preserved
         - All other columns preserved
     """
-    # Filter to ASE cases only (per user preference)
+    # Separate ASE cases from non-ASE blood cultures
     ase_cases = results[results["sepsis"] == 1].copy()
+    non_ase_cases = results[results["sepsis"] != 1].copy()
+
+    # Handle non-ASE cases: add episode_id = NA
+    non_ase_cases["episode_id"] = pd.NA
 
     if len(ase_cases) == 0:
-        # No ASE events - return empty DataFrame with episode_id column
-        ase_cases["episode_id"] = pd.Series(dtype="Int64")
-        return ase_cases
+        # No ASE events - just return non-ASE cases with episode_id column
+        # Reorder columns to put episode_id after bc_id
+        cols = list(non_ase_cases.columns)
+        if "episode_id" in cols and "bc_id" in cols:
+            cols.remove("episode_id")
+            bc_id_idx = cols.index("bc_id")
+            cols.insert(bc_id_idx + 1, "episode_id")
+            non_ase_cases = non_ase_cases[cols]
+        return non_ase_cases
 
-    # Sort by hospitalization and onset date
+    # Sort ASE cases by hospitalization and onset date
     ase_cases = ase_cases.sort_values(
         ["hospitalization_id", "ase_onset_w_lactate_dttm"]
     ).reset_index(drop=True)
@@ -1327,15 +1338,18 @@ def _apply_rit_post_processing(
     # Convert episode_id to appropriate dtype
     ase_filtered["episode_id"] = ase_filtered["episode_id"].astype("Int64")
 
+    # Combine ASE and non-ASE cases
+    combined = pd.concat([ase_filtered, non_ase_cases], ignore_index=True)
+
     # Reorder columns to put episode_id after bc_id
-    cols = list(ase_filtered.columns)
+    cols = list(combined.columns)
     if "episode_id" in cols and "bc_id" in cols:
         cols.remove("episode_id")
         bc_id_idx = cols.index("bc_id")
         cols.insert(bc_id_idx + 1, "episode_id")
-        ase_filtered = ase_filtered[cols]
+        combined = combined[cols]
 
-    return ase_filtered
+    return combined
 
 
 # =============================================================================
@@ -1417,12 +1431,13 @@ def calculate_ase(
     Returns
     -------
     pd.DataFrame
-        ASE results (only rows where sepsis=1) with columns:
+        ALL blood cultures (both ASE and non-ASE) with columns:
         - hospitalization_id: Unique encounter ID
         - bc_id: Blood culture ID within hospitalization (original)
-        - episode_id: Sequential ASE episode number after RIT (1, 2, 3...)
+        - episode_id: Sequential ASE episode number after RIT (1, 2, 3...), NA for non-ASE
         - presumed_infection: 1 = met criteria, 0 = not met
-        - sepsis: 1 = ASE case, 0 = not ASE
+        - sepsis: 1 = ASE case (with lactate), 0 = not ASE
+        - sepsis_wo_lactate: 1 = ASE case (without lactate), 0 = not ASE
         - type: "community" or "hospital" (based on onset day)
         - presumed_infection_onset_dttm: Earliest of blood culture/first QAD
         - ase_onset_w_lactate_dttm: ASE onset including lactate
@@ -1448,10 +1463,13 @@ def calculate_ase(
     -----
     - Each blood culture is evaluated independently with its own ±2 day window
     - RIT is applied AFTER determining which blood cultures meet ASE criteria
-    - Output contains only ASE events (sepsis=1); non-ASE blood cultures are filtered
+    - Output contains ALL blood cultures (both ASE and non-ASE)
     - bc_id preserves the original blood culture ID; episode_id is assigned after RIT
-    - To get only the first episode per hospitalization:
-        results = results[results['episode_id'] == 1]
+    - For ASE cases: episode_id = 1, 2, 3... (sequential after RIT)
+    - For non-ASE cases: episode_id = NA
+    - To get first episode per hospitalization (ASE) or first blood culture (non-ASE):
+        ase_first = results[results['episode_id'] == 1]
+        non_ase_first = results[results['episode_id'].isna()].drop_duplicates('hospitalization_id')
     """
     if verbose:
         print("=== Adult Sepsis Event (ASE) Calculation ===")
@@ -1724,14 +1742,20 @@ def calculate_ase(
 
     # Summary
     if verbose:
-        ase_count = len(result)  # Now all rows are ASE events
-        community_count = (result["type"] == "community").sum()
-        hospital_count = (result["type"] == "hospital").sum()
-        n_hosp_with_sepsis = result["hospitalization_id"].nunique()
+        total_bc = len(result)
+        ase_events = result[result["sepsis"] == 1]
+        ase_count = len(ase_events)
+        pi_count = (result["presumed_infection"] == 1).sum()
+        ase_wo_lactate_count = (result["sepsis_wo_lactate"] == 1).sum()
+        community_count = (ase_events["type"] == "community").sum()
+        hospital_count = (ase_events["type"] == "hospital").sum()
+        n_hosp_with_sepsis = ase_events["hospitalization_id"].nunique()
         rit_removed = pre_rit_ase_count - ase_count
         print("\n=== ASE Calculation Complete ===")
-        print(f"Blood cultures meeting ASE criteria: {pre_rit_ase_count:,}")
-        print(f"ASE events after RIT filtering: {ase_count:,}")
+        print(f"Total blood cultures evaluated: {total_bc:,}")
+        print(f"  Presumed infection: {pi_count:,}")
+        print(f"  ASE with lactate (sepsis): {ase_count:,}")
+        print(f"  ASE without lactate: {ase_wo_lactate_count:,}")
         if rit_removed > 0:
             print(f"  (Removed {rit_removed:,} duplicate ASE events within {rit_days}d RIT)")
         print(f"Unique hospitalizations with ASE: {n_hosp_with_sepsis:,}")

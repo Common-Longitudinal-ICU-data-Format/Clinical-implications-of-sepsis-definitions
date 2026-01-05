@@ -22,7 +22,7 @@ def _(mo):
     - Admitted 2018-2024
     - Admitted via the ED
     - Admitted to academic or community hospitals (excluding LTACH)
-    - Must have both ED and ICU locations during hospitalization
+    - Must have ED location during hospitalization
     """)
     return
 
@@ -166,22 +166,15 @@ def _(cohort_df_ed):
 
 @app.cell
 def _(adt, cohort_df_hospital):
-    # Filter 5: Must have both ED and ICU locations during hospitalization
-    # Get hospitalizations with ED location
+    # Filter 5: Must have ED location during hospitalization
     hosp_with_ed = set(adt.df[adt.df["location_category"] == "ed"]["hospitalization_id"].unique())
 
-    # Get hospitalizations with ICU location
-    hosp_with_icu = set(adt.df[adt.df["location_category"] == "icu"]["hospitalization_id"].unique())
-
-    # Require both ED and ICU
-    hosp_with_ed_and_icu = hosp_with_ed & hosp_with_icu
-
-    cohort_df_ed_icu = cohort_df_hospital[
-        cohort_df_hospital["hospitalization_id"].isin(hosp_with_ed_and_icu)
+    cohort_df_final = cohort_df_hospital[
+        cohort_df_hospital["hospitalization_id"].isin(hosp_with_ed)
     ].copy()
 
-    print(f"After ED+ICU location filter: {cohort_df_ed_icu['hospitalization_id'].nunique():,} hospitalizations")
-    return (cohort_df_ed_icu,)
+    print(f"After ED location filter: {cohort_df_final['hospitalization_id'].nunique():,} hospitalizations")
+    return (cohort_df_final,)
 
 
 @app.cell
@@ -193,9 +186,9 @@ def _(mo):
 
 
 @app.cell
-def _(cohort_df_ed_icu, patient, pd):
+def _(cohort_df_final, patient, pd):
     # Build final cohort with one row per hospitalization
-    final_cohort = cohort_df_ed_icu.drop_duplicates(subset=["hospitalization_id"]).copy()
+    final_cohort = cohort_df_final.drop_duplicates(subset=["hospitalization_id"]).copy()
 
     # Add patient demographics
     patient_df = patient.df[["patient_id", "death_dttm", "race_category", "sex_category", "ethnicity_category"]]
@@ -265,21 +258,32 @@ def _(importlib):
 
 
 @app.cell
-def _(ASE, final_cohort):
+def _(ASE, final_cohort, pd):
     # Get hospitalization IDs from cohort
     hosp_ids = final_cohort["hospitalization_id"].astype(str).unique().tolist()
     print(f"Running ASE calculation on {len(hosp_ids):,} hospitalizations...")
 
-    # Calculate ASE
+    # Calculate ASE (returns ALL blood cultures, both ASE and non-ASE)
     ase_results_all = ASE.calculate_ase(
         hospitalization_ids=hosp_ids,
         config_path="clif_config.json",
         verbose=True
     )
 
-    # Keep only first (index) ASE episode per hospitalization
-    ase_results = ase_results_all[ase_results_all["episode_id"] == 1].copy()
-    print(f"Filtered to first episode: {len(ase_results):,} hospitalizations (from {len(ase_results_all):,} total episodes)")
+    # Keep first ASE episode OR first blood culture (for non-ASE patients)
+    # For ASE patients: episode_id == 1 (first ASE after RIT)
+    # For non-ASE patients: first blood culture by date (episode_id is NA)
+    ase_first = ase_results_all[ase_results_all["episode_id"] == 1].copy()
+    non_ase_first = (
+        ase_results_all[ase_results_all["episode_id"].isna()]
+        .sort_values("blood_culture_dttm")
+        .drop_duplicates(subset=["hospitalization_id"], keep="first")
+    )
+    ase_results = pd.concat([ase_first, non_ase_first], ignore_index=True)
+
+    print(f"Filtered to first episode/BC: {len(ase_results):,} hospitalizations")
+    print(f"  - ASE cases: {ase_first['hospitalization_id'].nunique():,}")
+    print(f"  - Non-ASE with blood culture: {non_ase_first['hospitalization_id'].nunique():,}")
     return (ase_results,)
 
 
@@ -287,12 +291,14 @@ def _(ASE, final_cohort):
 def _(ase_results):
     # Display ASE summary
     print("ASE Results Summary:")
-    print(f"  Total episodes: {len(ase_results):,}")
+    print(f"  Total blood cultures evaluated: {len(ase_results):,}")
     print(f"  Presumed infection: {ase_results['presumed_infection'].sum():,}")
-    print(f"  ASE (sepsis): {ase_results['sepsis'].sum():,}")
+    print(f"  ASE with lactate (sepsis): {ase_results['sepsis'].sum():,}")
+    print(f"  ASE without lactate: {ase_results['sepsis_wo_lactate'].sum():,}")
     if "type" in ase_results.columns:
-        print(f"  Community-onset: {(ase_results['type'] == 'community').sum():,}")
-        print(f"  Hospital-onset: {(ase_results['type'] == 'hospital').sum():,}")
+        ase_only = ase_results[ase_results['sepsis'] == 1]
+        print(f"  Community-onset ASE: {(ase_only['type'] == 'community').sum():,}")
+        print(f"  Hospital-onset ASE: {(ase_only['type'] == 'hospital').sum():,}")
     return
 
 

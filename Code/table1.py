@@ -465,8 +465,8 @@ def _(
     # SINGLE ASSEMBLY POINT - merge all data into analysis_df
     analysis_df = pd.merge(
         cohort_df,
-        ase_df[['hospitalization_id', 'presumed_infection', 'sepsis', 'type',
-                'aki_dttm', 'vasopressor_dttm', 'hyperbilirubinemia_dttm',
+        ase_df[['hospitalization_id', 'presumed_infection', 'sepsis', 'sepsis_wo_lactate', 'type',
+                'blood_culture_dttm', 'aki_dttm', 'vasopressor_dttm', 'hyperbilirubinemia_dttm',
                 'thrombocytopenia_dttm', 'lactate_dttm', 'imv_dttm',
                 'ase_onset_w_lactate_dttm', 'ase_onset_wo_lactate_dttm',
                 'presumed_infection_onset_dttm']],
@@ -477,11 +477,15 @@ def _(
     # Fill NaN
     analysis_df['presumed_infection'] = analysis_df['presumed_infection'].fillna(0).astype(int)
     analysis_df['sepsis'] = analysis_df['sepsis'].fillna(0).astype(int)
+    analysis_df['sepsis_wo_lactate'] = analysis_df['sepsis_wo_lactate'].fillna(0).astype(int)
 
     # Create group indicators
+    # ASE with lactate: Meets ASE using 6 organ dysfunction criteria (lactate CAN count)
+    # ASE without lactate: Meets ASE using only 5 organ dysfunction criteria (lactate CANNOT count)
+    # Note: These groups are NOT mutually exclusive - a patient can be in both
     analysis_df['group_presumed_infection'] = analysis_df['presumed_infection'] == 1
-    analysis_df['group_ase_w_lactate'] = (analysis_df['sepsis'] == 1) & (analysis_df['lactate_dttm'].notna())
-    analysis_df['group_ase_wo_lactate'] = (analysis_df['sepsis'] == 1) & (analysis_df['lactate_dttm'].isna())
+    analysis_df['group_ase_w_lactate'] = analysis_df['sepsis'] == 1
+    analysis_df['group_ase_wo_lactate'] = analysis_df['sepsis_wo_lactate'] == 1
 
     # Merge all derived DataFrames
     analysis_df = analysis_df.merge(icu_df, on='hospitalization_id', how='left')
@@ -526,6 +530,11 @@ def _(
     analysis_df['discharge_dttm'] = pd.to_datetime(analysis_df['discharge_dttm'])
     analysis_df['hospital_los_days'] = (
         (analysis_df['discharge_dttm'] - analysis_df['admission_dttm']).dt.total_seconds() / 86400
+    )
+
+    # Time to blood culture (hours from admission)
+    analysis_df['time_to_bc_hours'] = (
+        (pd.to_datetime(analysis_df['blood_culture_dttm']) - analysis_df['admission_dttm']).dt.total_seconds() / 3600
     )
 
     # In-hospital death
@@ -664,6 +673,10 @@ def _(
     # Microbiology
     table1_rows.append({'Variable': '--- Microbiology ---', **{nm: '' for nm in groups}})
     table1_rows.append({'Variable': 'Positive blood cultures, mean (SD)', **{nm: summarize_continuous(df, 'positive_culture_count') for nm, df in groups.items()}})
+    table1_rows.append({
+        'Variable': 'Time to blood culture (hours), median (IQR)',
+        **{nm: summarize_median_iqr(df, 'time_to_bc_hours') for nm, df in groups.items()}
+    })
 
     table1 = pd.DataFrame(table1_rows)
     print("Table 1 created")
@@ -851,11 +864,6 @@ def _(
     })
 
     lactate_summary = pd.DataFrame(lactate_summary_rows)
-
-    # Save lactate counts sub-CSV
-    lactate_counts_path = OUTPUT_DIR / f"{SITE_NAME}_lactate_counts.csv"
-    lactate_counts_with_groups.to_csv(lactate_counts_path, index=False)
-    print(f"Lactate counts saved to: {lactate_counts_path}")
 
     # Save lactate summary
     lactate_summary_path = OUTPUT_DIR / f"{SITE_NAME}_lactate_counts_summary.csv"
