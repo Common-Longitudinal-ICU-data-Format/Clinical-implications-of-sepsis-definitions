@@ -29,12 +29,11 @@ def _(mo):
 
 @app.cell
 def _():
-    import importlib
     import json
     import pandas as pd
     from pathlib import Path
     from clifpy.tables import Patient, Hospitalization, Adt
-    return Adt, Hospitalization, Path, Patient, importlib, json, pd
+    return Adt, Hospitalization, Path, Patient, json, pd
 
 
 @app.cell
@@ -250,23 +249,27 @@ def _(mo):
 
 
 @app.cell
-def _(importlib):
-    # Import ASE module
-    import ASE
-    importlib.reload(ASE)
-    return (ASE,)
+def _():
+    from clifpy.utils.ase import compute_ase
+    return (compute_ase,)
 
 
 @app.cell
-def _(ASE, final_cohort, pd):
+def _(compute_ase, final_cohort, pd):
     # Get hospitalization IDs from cohort
     hosp_ids = final_cohort["hospitalization_id"].astype(str).unique().tolist()
     print(f"Running ASE calculation on {len(hosp_ids):,} hospitalizations...")
 
-    # Calculate ASE (returns ALL blood cultures, both ASE and non-ASE)
-    ase_results_all = ASE.calculate_ase(
+    # Calculate ASE using clifpy (returns ALL blood cultures, both ASE and non-ASE)
+    # include_lactate=True is REQUIRED to compare lactate vs non-lactate definitions
+    # - sepsis: ASE with lactate as organ dysfunction criterion
+    # - sepsis_wo_lactate: ASE without lactate criterion
+    ase_results_all = compute_ase(
         hospitalization_ids=hosp_ids,
         config_path="clif_config.json",
+        apply_rit=True,
+        rit_only_hospital_onset=True,
+        include_lactate=True,  # Must be True to compare lactate vs non-lactate
         verbose=True
     )
 

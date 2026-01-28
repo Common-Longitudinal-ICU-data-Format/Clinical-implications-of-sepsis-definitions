@@ -1,7 +1,7 @@
 import marimo
 
 __generated_with = "0.18.4"
-app = marimo.App(width="medium")
+app = marimo.App(width="full")
 
 
 @app.cell
@@ -16,9 +16,11 @@ def _(mo):
     # Table 1: Demographics and Outcomes by Sepsis Definition
 
     Compares demographics and outcomes across:
-    1. Presumed infection
-    2. ASE with lactate
-    3. ASE without lactate
+    1. No presumed infection (no blood culture + antibiotic criteria)
+    2. Presumed infection
+    3. ASE with lactate
+    4. ASE without lactate
+    5. Lactate-only ASE (qualified for ASE only because of lactate)
     """)
     return
 
@@ -323,6 +325,62 @@ def _(hosp_ids, micro, pd):
 
 
 @app.cell
+def _(ase_df, hosp_ids, micro, pd):
+    # Index BC analysis - match index blood culture to microbiology results
+    micro_raw_idx = micro.df.copy()
+    micro_raw_idx['collect_dttm'] = pd.to_datetime(micro_raw_idx['collect_dttm'], errors='coerce')
+
+    # Get index BC times from ASE results
+    index_bc_times = ase_df[['hospitalization_id', 'blood_culture_dttm']].copy()
+    index_bc_times['blood_culture_dttm'] = pd.to_datetime(index_bc_times['blood_culture_dttm'], errors='coerce')
+
+    # Merge micro data with index BC times
+    micro_with_index = pd.merge(micro_raw_idx, index_bc_times, on='hospitalization_id', how='inner')
+
+    # Calculate time difference from index BC (in days)
+    micro_with_index['days_from_index'] = (
+        (micro_with_index['collect_dttm'] - micro_with_index['blood_culture_dttm']).dt.total_seconds() / 86400
+    )
+
+    # Index BC: cultures collected on same day (within ~1 day tolerance for timing)
+    index_bc_cultures = micro_with_index[abs(micro_with_index['days_from_index']) < 1].copy()
+
+    # Window BC: cultures within ±2 days
+    window_bc_cultures = micro_with_index[abs(micro_with_index['days_from_index']) <= 2].copy()
+
+    # Determine if index BC was positive
+    index_bc_positive = index_bc_cultures[
+        (index_bc_cultures['organism_category'].notna()) &
+        (index_bc_cultures['organism_category'] != 'no_growth')
+    ]
+    index_bc_positive_hosp = set(index_bc_positive['hospitalization_id'].unique())
+
+    # Create index BC indicators dataframe
+    index_bc_df = pd.DataFrame({'hospitalization_id': hosp_ids})
+    index_bc_df['index_bc_positive'] = index_bc_df['hospitalization_id'].isin(index_bc_positive_hosp)
+
+    # Count BCs in window per hospitalization
+    window_bc_counts = window_bc_cultures.groupby('hospitalization_id').size().reset_index(name='bc_count_in_window')
+    index_bc_df = pd.merge(index_bc_df, window_bc_counts, on='hospitalization_id', how='left')
+    index_bc_df['bc_count_in_window'] = index_bc_df['bc_count_in_window'].fillna(0)
+
+    # Top 20 organisms from positive INDEX blood cultures
+    index_bc_organisms = index_bc_positive['organism_category'].value_counts().head(20)
+
+    # Top 20 organisms from ALL positive cultures in window
+    window_positive = window_bc_cultures[
+        (window_bc_cultures['organism_category'].notna()) &
+        (window_bc_cultures['organism_category'] != 'no_growth')
+    ]
+    window_bc_organisms = window_positive['organism_category'].value_counts().head(20)
+
+    print(f"Index BC positive: {len(index_bc_positive_hosp):,} patients")
+    print(f"Index BC organisms: {len(index_bc_organisms)} unique categories")
+    print(f"Window BC organisms: {len(window_bc_organisms)} unique categories")
+    return index_bc_df, index_bc_organisms, window_bc_organisms
+
+
+@app.cell
 def _(dx, pd):
     # Compute CCI - returns NEW DataFrame
     try:
@@ -345,94 +403,34 @@ def _(mo):
 
 
 @app.cell
-def _(Path, cohort_df, hosp_ids, json, pd):
-    # Compute SOFA scores using ClifOrchestrator
-    from clifpy.clif_orchestrator import ClifOrchestrator
-    from clifpy.utils.sofa import REQUIRED_SOFA_CATEGORIES_BY_TABLE
+def _(Path, cohort_df, json, pd):
+    import polars as pl
+    from clifpy import compute_sofa_polars
 
-    sofa_cohort = pd.DataFrame({
-        'hospitalization_id': cohort_df['hospitalization_id'],
-        'start_time': pd.to_datetime(cohort_df['admission_dttm']),
-        'end_time': pd.to_datetime(cohort_df['discharge_dttm'])
-    })
-
-    # Load config inline (avoid reusing 'f')
+    # Load config
     sofa_cfg = json.loads(Path("clif_config.json").read_text())
 
-    co = ClifOrchestrator(
-        data_directory=sofa_cfg["data_directory"],
-        filetype=sofa_cfg["filetype"],
-        timezone=sofa_cfg["timezone"]
-    )
-
-    print("Loading tables for SOFA...")
-
-    co.load_table('labs', filters={
-        'hospitalization_id': hosp_ids,
-        'lab_category': ['creatinine', 'platelet_count', 'po2_arterial', 'bilirubin_total']
-    }, columns=['hospitalization_id', 'lab_result_dttm', 'lab_category', 'lab_value_numeric'])
-
-    co.load_table('vitals', filters={
-        'hospitalization_id': hosp_ids,
-        'vital_category': ['map', 'spo2', 'weight_kg', 'height_cm']
-    }, columns=['hospitalization_id', 'recorded_dttm', 'vital_category', 'vital_value'])
-
-    co.load_table('patient_assessments', filters={
-        'hospitalization_id': hosp_ids,
-        'assessment_category': ['gcs_total']
-    }, columns=['hospitalization_id', 'recorded_dttm', 'assessment_category', 'numerical_value'])
-
-    co.load_table('medication_admin_continuous', filters={
-        'hospitalization_id': hosp_ids,
-        'med_category': ['norepinephrine', 'epinephrine', 'dopamine', 'dobutamine']
+    # Create cohort DataFrame for Polars
+    sofa_cohort = pl.DataFrame({
+        'hospitalization_id': cohort_df['hospitalization_id'].astype(str).tolist(),
+        'start_dttm': pd.to_datetime(cohort_df['admission_dttm']).tolist(),
+        'end_dttm': pd.to_datetime(cohort_df['discharge_dttm']).tolist()
     })
 
-    co.load_table('respiratory_support', filters={'hospitalization_id': hosp_ids},
-                  columns=['hospitalization_id', 'recorded_dttm', 'device_category', 'fio2_set'])
+    print("Computing SOFA scores with Polars...")
 
-    # Clean and convert medication data
-    if len(co.medication_admin_continuous.df) > 0:
-        sofa_med_df = co.medication_admin_continuous.df.copy()
-        sofa_med_df = sofa_med_df[sofa_med_df['med_dose'].notna()]
-        sofa_med_df = sofa_med_df[sofa_med_df['med_dose_unit'].notna()]
-        sofa_med_df = sofa_med_df[~sofa_med_df['med_dose_unit'].astype(str).str.lower().isin(['nan', 'none', ''])]
-        co.medication_admin_continuous.df = sofa_med_df
-
-        sofa_preferred_units = {
-            'norepinephrine': 'mcg/kg/min', 'epinephrine': 'mcg/kg/min',
-            'dopamine': 'mcg/kg/min', 'dobutamine': 'mcg/kg/min'
-        }
-        co.convert_dose_units_for_continuous_meds(preferred_units=sofa_preferred_units, override=True)
-
-        if hasattr(co.medication_admin_continuous, 'df_converted'):
-            sofa_med_success = co.medication_admin_continuous.df_converted[
-                co.medication_admin_continuous.df_converted['_convert_status'] == 'success'
-            ].copy()
-            co.medication_admin_continuous.df_converted = sofa_med_success
-
-    # Create wide dataset
-    co.create_wide_dataset(
-        category_filters=REQUIRED_SOFA_CATEGORIES_BY_TABLE,
+    # Compute SOFA scores using high-performance Polars implementation
+    sofa_scores_pl = compute_sofa_polars(
+        data_directory=sofa_cfg["data_directory"],
         cohort_df=sofa_cohort,
-        return_dataframe=True
-    )
-
-    # Add missing med columns - use list comprehension instead of for loop
-    sofa_med_cols = ['norepinephrine_mcg_kg_min', 'epinephrine_mcg_kg_min', 'dopamine_mcg_kg_min', 'dobutamine_mcg_kg_min']
-    missing_sofa_cols = [c for c in sofa_med_cols if c not in co.wide_df.columns]
-    if missing_sofa_cols:
-        co.wide_df = co.wide_df.assign(**{c: None for c in missing_sofa_cols})
-
-    # Compute SOFA
-    sofa_scores = co.compute_sofa_scores(
-        wide_df=co.wide_df,
-        id_name='hospitalization_id',
+        filetype=sofa_cfg["filetype"],
+        timezone=sofa_cfg["timezone"],
         fill_na_scores_with_zero=True,
-        remove_outliers=True,
-        create_new_wide_df=False
+        remove_outliers=True
     )
 
-    # Get max SOFA per hospitalization
+    # Convert to pandas and get max SOFA per hospitalization
+    sofa_scores = sofa_scores_pl.to_pandas()
     sofa_df = sofa_scores.groupby('hospitalization_id')['sofa_total'].max().reset_index()
     sofa_df.columns = ['hospitalization_id', 'max_sofa']
 
@@ -456,6 +454,7 @@ def _(
     crrt_df,
     first_vital_df,
     icu_df,
+    index_bc_df,
     micro_df,
     pd,
     resp_df,
@@ -469,7 +468,9 @@ def _(
                 'blood_culture_dttm', 'aki_dttm', 'vasopressor_dttm', 'hyperbilirubinemia_dttm',
                 'thrombocytopenia_dttm', 'lactate_dttm', 'imv_dttm',
                 'ase_onset_w_lactate_dttm', 'ase_onset_wo_lactate_dttm',
-                'presumed_infection_onset_dttm']],
+                'presumed_infection_onset_dttm',
+                'ase_first_criteria_w_lactate', 'ase_first_criteria_wo_lactate',
+                'vasopressor_name', 'total_qad']],
         on='hospitalization_id',
         how='left'
     )
@@ -487,6 +488,10 @@ def _(
     analysis_df['group_ase_w_lactate'] = analysis_df['sepsis'] == 1
     analysis_df['group_ase_wo_lactate'] = analysis_df['sepsis_wo_lactate'] == 1
 
+    # NEW: No presumed infection and lactate-only ASE groups
+    analysis_df['group_no_presumed_infection'] = analysis_df['presumed_infection'] == 0
+    analysis_df['group_lactate_only_ase'] = (analysis_df['sepsis'] == 1) & (analysis_df['ase_first_criteria_w_lactate'] == 'lactate')
+
     # Merge all derived DataFrames
     analysis_df = analysis_df.merge(icu_df, on='hospitalization_id', how='left')
     analysis_df = analysis_df.merge(crrt_df, on='hospitalization_id', how='left')
@@ -496,6 +501,7 @@ def _(
     analysis_df = analysis_df.merge(sofa_df, on='hospitalization_id', how='left')
     analysis_df = analysis_df.merge(cci_df, on='hospitalization_id', how='left')
     analysis_df = analysis_df.merge(first_vital_df, on='hospitalization_id', how='left')
+    analysis_df = analysis_df.merge(index_bc_df, on='hospitalization_id', how='left')
 
     # Compute time to first organ failure (hours from first vital)
     organ_failure_cols = ['aki_dttm', 'vasopressor_dttm', 'hyperbilirubinemia_dttm',
@@ -525,6 +531,81 @@ def _(
     analysis_df['had_thrombocytopenia'] = analysis_df['thrombocytopenia_dttm'].notna()
     analysis_df['had_elevated_lactate'] = analysis_df['lactate_dttm'].notna()
 
+    # Count of organ dysfunctions per patient (6 CDC criteria)
+    analysis_df['organ_dysfunction_count'] = (
+        analysis_df['had_vasopressor'].astype(int) +
+        analysis_df['had_imv'].astype(int) +
+        analysis_df['had_aki'].astype(int) +
+        analysis_df['had_hyperbili'].astype(int) +
+        analysis_df['had_thrombocytopenia'].astype(int) +
+        analysis_df['had_elevated_lactate'].astype(int)
+    )
+
+    # Rank organ failures by timestamp and compute time to 2nd organ failure
+    def compute_organ_sequence(row, include_lactate=True):
+        """Get ordered organ failure datetimes for a patient"""
+        cols = ['vasopressor_dttm', 'imv_dttm', 'aki_dttm',
+                'hyperbilirubinemia_dttm', 'thrombocytopenia_dttm']
+        if include_lactate:
+            cols.append('lactate_dttm')
+
+        times = [(row[c], c) for c in cols if pd.notna(row.get(c))]
+        times.sort(key=lambda x: x[0])
+        return times
+
+    # Compute time from 1st to 2nd organ failure (with lactate)
+    def time_to_second_organ(row):
+        times = compute_organ_sequence(row, include_lactate=True)
+        if len(times) >= 2:
+            return (times[1][0] - times[0][0]).total_seconds() / 3600
+        return None
+
+    analysis_df['time_to_second_organ_hours'] = analysis_df.apply(time_to_second_organ, axis=1)
+
+    # Compute sequential time differences for CSV
+    sequence_data = []
+    for _, seq_row in analysis_df[analysis_df['group_ase_w_lactate']].iterrows():
+        # With lactate
+        times_w = compute_organ_sequence(seq_row, include_lactate=True)
+        for i in range(len(times_w) - 1):
+            diff_hours = (times_w[i+1][0] - times_w[i][0]).total_seconds() / 3600
+            sequence_data.append({
+                'hospitalization_id': seq_row['hospitalization_id'],
+                'transition': f'{i+1}_to_{i+2}',
+                'lactate_included': True,
+                'time_diff_hours': diff_hours,
+                'from_organ': times_w[i][1].replace('_dttm', ''),
+                'to_organ': times_w[i+1][1].replace('_dttm', '')
+            })
+
+        # Without lactate
+        times_wo = compute_organ_sequence(seq_row, include_lactate=False)
+        for i in range(len(times_wo) - 1):
+            diff_hours = (times_wo[i+1][0] - times_wo[i][0]).total_seconds() / 3600
+            sequence_data.append({
+                'hospitalization_id': seq_row['hospitalization_id'],
+                'transition': f'{i+1}_to_{i+2}',
+                'lactate_included': False,
+                'time_diff_hours': diff_hours,
+                'from_organ': times_wo[i][1].replace('_dttm', ''),
+                'to_organ': times_wo[i+1][1].replace('_dttm', '')
+            })
+
+    sequence_df = pd.DataFrame(sequence_data)
+
+    # Aggregate for CSV output
+    if len(sequence_df) > 0:
+        sequence_summary = sequence_df.groupby(['transition', 'lactate_included']).agg(
+            mean_hours=('time_diff_hours', 'mean'),
+            sd_hours=('time_diff_hours', 'std'),
+            median_hours=('time_diff_hours', 'median'),
+            q25_hours=('time_diff_hours', lambda x: x.quantile(0.25)),
+            q75_hours=('time_diff_hours', lambda x: x.quantile(0.75)),
+            n=('time_diff_hours', 'count')
+        ).reset_index()
+    else:
+        sequence_summary = pd.DataFrame(columns=['transition', 'lactate_included', 'mean_hours', 'sd_hours', 'median_hours', 'q25_hours', 'q75_hours', 'n'])
+
     # LOS calculations
     analysis_df['admission_dttm'] = pd.to_datetime(analysis_df['admission_dttm'])
     analysis_df['discharge_dttm'] = pd.to_datetime(analysis_df['discharge_dttm'])
@@ -545,10 +626,12 @@ def _(
     )
 
     print(f"Analysis dataset assembled: {len(analysis_df):,} hospitalizations")
+    print(f"No presumed infection: {analysis_df['group_no_presumed_infection'].sum():,}")
     print(f"Presumed infection: {analysis_df['group_presumed_infection'].sum():,}")
     print(f"ASE with lactate: {analysis_df['group_ase_w_lactate'].sum():,}")
     print(f"ASE without lactate: {analysis_df['group_ase_wo_lactate'].sum():,}")
-    return (analysis_df,)
+    print(f"Lactate-only ASE: {analysis_df['group_lactate_only_ase'].sum():,}")
+    return analysis_df, sequence_summary
 
 
 @app.cell
@@ -588,6 +671,7 @@ def _():
 def _(
     analysis_df,
     pd,
+    sequence_summary,
     summarize_binary,
     summarize_continuous,
     summarize_median_iqr,
@@ -595,9 +679,11 @@ def _(
     # Create Table 1 - using dict comprehensions instead of for loops
     groups = {
         'Total': analysis_df,
+        'No Presumed Infection': analysis_df[analysis_df['group_no_presumed_infection']],
         'Presumed Infection': analysis_df[analysis_df['group_presumed_infection']],
         'ASE with Lactate': analysis_df[analysis_df['group_ase_w_lactate']],
-        'ASE without Lactate': analysis_df[analysis_df['group_ase_wo_lactate']]
+        'ASE without Lactate': analysis_df[analysis_df['group_ase_wo_lactate']],
+        'Lactate-only ASE': analysis_df[analysis_df['group_lactate_only_ase']]
     }
 
     table1_rows = []
@@ -626,6 +712,16 @@ def _(
     table1_rows.append({'Variable': '--- Comorbidities ---', **{nm: '' for nm in groups}})
     table1_rows.append({'Variable': 'CCI, mean (SD)', **{nm: summarize_continuous(df, 'cci_score') for nm, df in groups.items()}})
 
+    # QADs - only for groups with presumed infection (not Total or No Presumed Infection)
+    qad_excluded_groups = {'Total', 'No Presumed Infection'}
+    row = {'Variable': 'QADs, mean (SD)'}
+    for nm, df in groups.items():
+        if nm in qad_excluded_groups:
+            row[nm] = 'N/A'
+        else:
+            row[nm] = summarize_continuous(df, 'total_qad')
+    table1_rows.append(row)
+
     # Acuity
     table1_rows.append({'Variable': '--- Acuity ---', **{nm: '' for nm in groups}})
     table1_rows.append({'Variable': 'Max SOFA, mean (SD)', **{nm: summarize_continuous(df, 'max_sofa') for nm, df in groups.items()}})
@@ -642,23 +738,111 @@ def _(
 
     # Life Support
     table1_rows.append({'Variable': '--- Life Support ---', **{nm: '' for nm in groups}})
+    # Any Life Support (any of CRRT, IMV, NIPPV, HFNO, Vasopressor)
+    table1_rows.append({
+        'Variable': 'Any Life Support, n (%)',
+        **{nm: summarize_binary(df, df['had_crrt'] | df['had_imv'] | df['had_nippv'] | df['had_hfno'] | df['had_vasopressor']) for nm, df in groups.items()}
+    })
     life_support = [('had_crrt', 'CRRT'), ('had_imv', 'IMV'), ('had_nippv', 'NIPPV'), ('had_hfno', 'HFNO'), ('had_vasopressor', 'Vasopressor')]
     table1_rows.extend([
         {'Variable': f'{lbl}, n (%)', **{nm: summarize_binary(df, vr) for nm, df in groups.items()}}
         for vr, lbl in life_support
     ])
 
-    # Organ Failure
+    # Organ Failure (CDC) - Only applicable to ASE groups
     table1_rows.append({'Variable': '--- Organ Failure (CDC) ---', **{nm: '' for nm in groups}})
-    organ_failure = [('had_aki', 'AKI'), ('had_hyperbili', 'Hyperbilirubinemia'), ('had_thrombocytopenia', 'Thrombocytopenia'), ('had_elevated_lactate', 'Elevated Lactate')]
-    table1_rows.extend([
-        {'Variable': f'{lbl}, n (%)', **{nm: summarize_binary(df, vr) for nm, df in groups.items()}}
-        for vr, lbl in organ_failure
-    ])
-    # Time to first organ failure
+
+    # Define ASE-only groups (organ failure only relevant for these)
+    ase_group_names = {'ASE with Lactate', 'ASE without Lactate', 'Lactate-only ASE'}
+
+    # All 6 CDC organ dysfunction criteria
+    organ_failure = [
+        ('had_vasopressor', 'Vasopressor'),
+        ('had_imv', 'IMV'),
+        ('had_aki', 'AKI'),
+        ('had_hyperbili', 'Hyperbilirubinemia'),
+        ('had_thrombocytopenia', 'Thrombocytopenia'),
+        ('had_elevated_lactate', 'Elevated Lactate')
+    ]
+
+    for vr, lbl in organ_failure:
+        row = {'Variable': f'{lbl}, n (%)'}
+        for nm, df in groups.items():
+            if nm in ase_group_names:
+                row[nm] = summarize_binary(df, vr)
+            else:
+                row[nm] = 'N/A'
+        table1_rows.append(row)
+
+    # Mean organ dysfunction count - only for ASE groups
+    row = {'Variable': 'Organ dysfunctions, mean (SD)'}
+    for nm, df in groups.items():
+        if nm in ase_group_names:
+            row[nm] = summarize_continuous(df, 'organ_dysfunction_count')
+        else:
+            row[nm] = 'N/A'
+    table1_rows.append(row)
+
+    # Time to first organ failure (also only for ASE groups)
+    row = {'Variable': 'Time to first organ failure (hours), median (IQR)'}
+    for nm, df in groups.items():
+        if nm in ase_group_names:
+            row[nm] = summarize_median_iqr(df, 'time_to_organ_failure_hours')
+        else:
+            row[nm] = 'N/A'
+    table1_rows.append(row)
+
+    # Time to second organ failure (also only for ASE groups)
+    row = {'Variable': 'Time to second organ failure (hours), median (IQR)'}
+    for nm, df in groups.items():
+        if nm in ase_group_names:
+            row[nm] = summarize_median_iqr(df, 'time_to_second_organ_hours')
+        else:
+            row[nm] = 'N/A'
+    table1_rows.append(row)
+
+    # First ASE Criteria Distribution - Only applicable to ASE groups
+    table1_rows.append({'Variable': '--- First ASE Criteria ---', **{nm: '' for nm in groups}})
+
+    # Helper function to summarize first criteria
+    def summarize_first_criteria(df, col):
+        """Summarize first criteria as most common criterion"""
+        if col not in df.columns:
+            return "N/A"
+        vals = df[col].dropna()
+        if len(vals) == 0:
+            return "N/A"
+        counts = vals.value_counts()
+        if len(counts) == 0:
+            return "N/A"
+        top = counts.index[0]
+        n = counts.iloc[0]
+        total = len(vals)
+        return f"{top}: {n} ({100*n/total:.1f}%)"
+
+    # First criteria for ASE with lactate (only for ASE groups)
+    row = {'Variable': 'First criterion (w/ lactate), top'}
+    for nm, df in groups.items():
+        if nm in ase_group_names:
+            row[nm] = summarize_first_criteria(df, 'ase_first_criteria_w_lactate')
+        else:
+            row[nm] = 'N/A'
+    table1_rows.append(row)
+
+    # First criteria for ASE without lactate (only for ASE groups)
+    row = {'Variable': 'First criterion (w/o lactate), top'}
+    for nm, df in groups.items():
+        if nm in ase_group_names:
+            row[nm] = summarize_first_criteria(df, 'ase_first_criteria_wo_lactate')
+        else:
+            row[nm] = 'N/A'
+    table1_rows.append(row)
+
+    # Vasopressor name distribution (for patients with vasopressor - applies to all groups)
+    vaso_groups = {nm: df[df['had_vasopressor']] for nm, df in groups.items()}
     table1_rows.append({
-        'Variable': 'Time to first organ failure (hours), median (IQR)',
-        **{nm: summarize_median_iqr(df, 'time_to_organ_failure_hours') for nm, df in groups.items()}
+        'Variable': 'Vasopressor (top), n (%)',
+        **{nm: summarize_first_criteria(df, 'vasopressor_name') for nm, df in vaso_groups.items()}
     })
 
     # Outcomes
@@ -673,6 +857,26 @@ def _(
     # Microbiology
     table1_rows.append({'Variable': '--- Microbiology ---', **{nm: '' for nm in groups}})
     table1_rows.append({'Variable': 'Positive blood cultures, mean (SD)', **{nm: summarize_continuous(df, 'positive_culture_count') for nm, df in groups.items()}})
+
+    # Index BC positivity - only for groups with presumed infection
+    pi_groups = {'Presumed Infection', 'ASE with Lactate', 'ASE without Lactate', 'Lactate-only ASE'}
+    row = {'Variable': 'Positive index BC, n (%)'}
+    for nm, df in groups.items():
+        if nm in pi_groups:
+            row[nm] = summarize_binary(df, 'index_bc_positive')
+        else:
+            row[nm] = 'N/A'
+    table1_rows.append(row)
+
+    # BCs in index window - only for groups with presumed infection
+    row = {'Variable': 'BCs in index window, mean (SD)'}
+    for nm, df in groups.items():
+        if nm in pi_groups:
+            row[nm] = summarize_continuous(df, 'bc_count_in_window')
+        else:
+            row[nm] = 'N/A'
+    table1_rows.append(row)
+
     table1_rows.append({
         'Variable': 'Time to blood culture (hours), median (IQR)',
         **{nm: summarize_median_iqr(df, 'time_to_bc_hours') for nm, df in groups.items()}
@@ -680,7 +884,7 @@ def _(
 
     table1 = pd.DataFrame(table1_rows)
     print("Table 1 created")
-    return (table1,)
+    return sequence_summary, table1
 
 
 @app.cell
@@ -692,16 +896,31 @@ def _(mo):
 
 
 @app.cell
-def _(OUTPUT_DIR, SITE_NAME, table1, top_organisms):
+def _(OUTPUT_DIR, SITE_NAME, index_bc_organisms, sequence_summary, table1, top_organisms, window_bc_organisms):
     # Save main Table 1
     table1_path = OUTPUT_DIR / f"{SITE_NAME}_table1.csv"
     table1.to_csv(table1_path, index=False)
     print(f"Table 1 saved to: {table1_path}")
 
-    # Save top organisms
+    # Save top organisms (all positive cultures)
     organisms_path = OUTPUT_DIR / f"{SITE_NAME}_top20_organisms.csv"
     top_organisms.to_csv(organisms_path)
     print(f"Top 20 organisms saved to: {organisms_path}")
+
+    # Save index BC organisms (positive index blood cultures only)
+    index_bc_org_path = OUTPUT_DIR / f"{SITE_NAME}_index_bc_top20_organisms.csv"
+    index_bc_organisms.to_csv(index_bc_org_path)
+    print(f"Index BC organisms saved to: {index_bc_org_path}")
+
+    # Save window BC organisms (all positive cultures in ±2 day window)
+    window_bc_org_path = OUTPUT_DIR / f"{SITE_NAME}_window_bc_top20_organisms.csv"
+    window_bc_organisms.to_csv(window_bc_org_path)
+    print(f"Window BC organisms saved to: {window_bc_org_path}")
+
+    # Save organ failure sequence times
+    sequence_path = OUTPUT_DIR / f"{SITE_NAME}_organ_failure_sequence_times.csv"
+    sequence_summary.to_csv(sequence_path, index=False)
+    print(f"Organ failure sequence times saved to: {sequence_path}")
     return
 
 
@@ -720,7 +939,7 @@ def _(mo):
 
 
 @app.cell
-def _(OUTPUT_DIR, SITE_NAME, analysis_df, pd):
+def _(OUTPUT_DIR, SITE_NAME, analysis_df, pd, sequence_summary):
     # Create site-level summary grouped by year, health_system, hospital_id, hospital_type
     # This output is designed for aggregation across multiple sites
 
@@ -788,6 +1007,7 @@ def _(
     analysis_df,
     labs_lactate,
     pd,
+    sequence_summary,
     summarize_median_iqr,
 ):
     # Compute lactate counts before each criteria was met
@@ -828,13 +1048,22 @@ def _(
     # Merge back to analysis_df to get group info
     lactate_counts_with_groups = pd.merge(
         lactate_counts,
-        analysis_df[['hospitalization_id', 'group_presumed_infection', 'group_ase_w_lactate', 'group_ase_wo_lactate']],
+        analysis_df[['hospitalization_id', 'group_no_presumed_infection', 'group_presumed_infection', 'group_ase_w_lactate', 'group_ase_wo_lactate', 'group_lactate_only_ase']],
         on='hospitalization_id',
         how='left'
     )
 
     # Create summary by group
     lactate_summary_rows = []
+
+    # No presumed infection group
+    no_pi_subset = lactate_counts_with_groups[lactate_counts_with_groups['group_no_presumed_infection']]
+    lactate_summary_rows.append({
+        'Group': 'No Presumed Infection',
+        'Criteria': 'N/A (no criteria met)',
+        'N': len(no_pi_subset),
+        'Lactates before criteria, median (IQR)': 'N/A'
+    })
 
     # Presumed infection group
     pi_subset = lactate_counts_with_groups[lactate_counts_with_groups['group_presumed_infection']]
@@ -863,6 +1092,15 @@ def _(
         'Lactates before criteria, median (IQR)': summarize_median_iqr(ase_wo_subset, 'lactates_before_ase_wo_lactate')
     })
 
+    # Lactate-only ASE group
+    lactate_only_subset = lactate_counts_with_groups[lactate_counts_with_groups['group_lactate_only_ase']]
+    lactate_summary_rows.append({
+        'Group': 'Lactate-only ASE',
+        'Criteria': 'Before ASE with Lactate onset',
+        'N': len(lactate_only_subset),
+        'Lactates before criteria, median (IQR)': summarize_median_iqr(lactate_only_subset, 'lactates_before_ase_w_lactate')
+    })
+
     lactate_summary = pd.DataFrame(lactate_summary_rows)
 
     # Save lactate summary
@@ -887,8 +1125,10 @@ def _(
     SITE_NAME,
     analysis_df,
     pd,
+    sequence_summary,
     summarize_binary,
     summarize_continuous,
+    summarize_median_iqr,
 ):
     # Create stratified tables - using a local function with unique internal variables
 
@@ -900,26 +1140,177 @@ def _(
 
         grps = {
             'Total': subset,
+            'No Presumed Infection': subset[subset['group_no_presumed_infection']],
             'Presumed Infection': subset[subset['group_presumed_infection']],
             'ASE with Lactate': subset[subset['group_ase_w_lactate']],
-            'ASE without Lactate': subset[subset['group_ase_wo_lactate']]
+            'ASE without Lactate': subset[subset['group_ase_wo_lactate']],
+            'Lactate-only ASE': subset[subset['group_lactate_only_ase']]
         }
 
         rws = []
+
+        # N
         rws.append({'Variable': 'N', **{n: str(len(g)) for n, g in grps.items()}})
+
+        # Demographics
         rws.append({'Variable': '--- Demographics ---', **{n: '' for n in grps}})
         rws.append({'Variable': 'Age, mean (SD)', **{n: summarize_continuous(g, 'age_at_admission') for n, g in grps.items()}})
-        rws.append({'Variable': '--- Acuity ---', **{n: '' for n in grps}})
-        rws.append({'Variable': 'CCI, mean (SD)', **{n: summarize_continuous(g, 'cci_score') for n, g in grps.items()}})
-        rws.append({'Variable': 'Max SOFA, mean (SD)', **{n: summarize_continuous(g, 'max_sofa') for n, g in grps.items()}})
-        rws.append({'Variable': '--- Life Support ---', **{n: '' for n in grps}})
+        rws.append({'Variable': 'Sex - Male, n (%)', **{n: summarize_binary(g, g['sex_category'].str.lower() == 'male') for n, g in grps.items()}})
+        rws.append({'Variable': 'Sex - Female, n (%)', **{n: summarize_binary(g, g['sex_category'].str.lower() == 'female') for n, g in grps.items()}})
 
+        # Race
+        rws.append({'Variable': '--- Race ---', **{n: '' for n in grps}})
+        race_cats = subset['race_category'].dropna().unique()[:5].tolist()
+        rws.extend([
+            {'Variable': f'Race - {rc}, n (%)', **{n: summarize_binary(g, g['race_category'] == rc) for n, g in grps.items()}}
+            for rc in race_cats
+        ])
+
+        # Comorbidities
+        rws.append({'Variable': '--- Comorbidities ---', **{n: '' for n in grps}})
+        rws.append({'Variable': 'CCI, mean (SD)', **{n: summarize_continuous(g, 'cci_score') for n, g in grps.items()}})
+
+        # QADs - only for groups with presumed infection (not Total or No Presumed Infection)
+        qad_excluded_groups = {'Total', 'No Presumed Infection'}
+        row = {'Variable': 'QADs, mean (SD)'}
+        for n, g in grps.items():
+            if n in qad_excluded_groups:
+                row[n] = 'N/A'
+            else:
+                row[n] = summarize_continuous(g, 'total_qad')
+        rws.append(row)
+
+        # Acuity
+        rws.append({'Variable': '--- Acuity ---', **{n: '' for n in grps}})
+        rws.append({'Variable': 'Max SOFA, mean (SD)', **{n: summarize_continuous(g, 'max_sofa') for n, g in grps.items()}})
+
+        # ICU
+        rws.append({'Variable': '--- ICU ---', **{n: '' for n in grps}})
+        rws.append({'Variable': 'Any ICU, n (%)', **{n: summarize_binary(g, 'had_icu') for n, g in grps.items()}})
+        icu_type_cols = ['icu_cardiac_icu', 'icu_neuro_icu', 'icu_surgical_icu', 'icu_medical_icu']
+        rws.extend([
+            {'Variable': f'{col}, n (%)', **{n: summarize_binary(g, col) for n, g in grps.items()}}
+            for col in icu_type_cols
+        ])
+
+        # Life Support
+        rws.append({'Variable': '--- Life Support ---', **{n: '' for n in grps}})
+        # Any Life Support (any of CRRT, IMV, NIPPV, HFNO, Vasopressor)
+        rws.append({
+            'Variable': 'Any Life Support, n (%)',
+            **{n: summarize_binary(g, g['had_crrt'] | g['had_imv'] | g['had_nippv'] | g['had_hfno'] | g['had_vasopressor']) for n, g in grps.items()}
+        })
         ls_vars = [('had_crrt', 'CRRT'), ('had_imv', 'IMV'), ('had_nippv', 'NIPPV'), ('had_hfno', 'HFNO'), ('had_vasopressor', 'Vasopressor')]
         rws.extend([{'Variable': f'{lb}, n (%)', **{n: summarize_binary(g, v) for n, g in grps.items()}} for v, lb in ls_vars])
 
+        # Organ Failure (CDC) - Only applicable to ASE groups
+        rws.append({'Variable': '--- Organ Failure (CDC) ---', **{n: '' for n in grps}})
+        ase_group_names = {'ASE with Lactate', 'ASE without Lactate', 'Lactate-only ASE'}
+        organ_failure = [
+            ('had_vasopressor', 'Vasopressor'),
+            ('had_imv', 'IMV'),
+            ('had_aki', 'AKI'),
+            ('had_hyperbili', 'Hyperbilirubinemia'),
+            ('had_thrombocytopenia', 'Thrombocytopenia'),
+            ('had_elevated_lactate', 'Elevated Lactate')
+        ]
+        for vr, lbl in organ_failure:
+            row = {'Variable': f'{lbl}, n (%)'}
+            for n, g in grps.items():
+                row[n] = summarize_binary(g, vr) if n in ase_group_names else 'N/A'
+            rws.append(row)
+
+        # Mean organ dysfunction count - only for ASE groups
+        row = {'Variable': 'Organ dysfunctions, mean (SD)'}
+        for n, g in grps.items():
+            if n in ase_group_names:
+                row[n] = summarize_continuous(g, 'organ_dysfunction_count')
+            else:
+                row[n] = 'N/A'
+        rws.append(row)
+
+        # Time to first organ failure (ASE groups only)
+        row = {'Variable': 'Time to first organ failure (hours), median (IQR)'}
+        for n, g in grps.items():
+            row[n] = summarize_median_iqr(g, 'time_to_organ_failure_hours') if n in ase_group_names else 'N/A'
+        rws.append(row)
+
+        # Time to second organ failure (ASE groups only)
+        row = {'Variable': 'Time to second organ failure (hours), median (IQR)'}
+        for n, g in grps.items():
+            row[n] = summarize_median_iqr(g, 'time_to_second_organ_hours') if n in ase_group_names else 'N/A'
+        rws.append(row)
+
+        # First ASE Criteria (ASE groups only)
+        rws.append({'Variable': '--- First ASE Criteria ---', **{n: '' for n in grps}})
+
+        def summarize_first_criteria(df, col):
+            if col not in df.columns:
+                return "N/A"
+            vals = df[col].dropna()
+            if len(vals) == 0:
+                return "N/A"
+            counts = vals.value_counts()
+            if len(counts) == 0:
+                return "N/A"
+            top = counts.index[0]
+            cnt = counts.iloc[0]
+            total = len(vals)
+            return f"{top}: {cnt} ({100*cnt/total:.1f}%)"
+
+        row = {'Variable': 'First criterion (w/ lactate), top'}
+        for n, g in grps.items():
+            row[n] = summarize_first_criteria(g, 'ase_first_criteria_w_lactate') if n in ase_group_names else 'N/A'
+        rws.append(row)
+
+        row = {'Variable': 'First criterion (w/o lactate), top'}
+        for n, g in grps.items():
+            row[n] = summarize_first_criteria(g, 'ase_first_criteria_wo_lactate') if n in ase_group_names else 'N/A'
+        rws.append(row)
+
+        # Vasopressor name
+        vaso_grps = {n: g[g['had_vasopressor']] for n, g in grps.items()}
+        rws.append({
+            'Variable': 'Vasopressor (top), n (%)',
+            **{n: summarize_first_criteria(g, 'vasopressor_name') for n, g in vaso_grps.items()}
+        })
+
+        # Outcomes
         rws.append({'Variable': '--- Outcomes ---', **{n: '' for n in grps}})
         rws.append({'Variable': 'Hospital LOS, mean (SD)', **{n: summarize_continuous(g, 'hospital_los_days') for n, g in grps.items()}})
+        rws.append({
+            'Variable': 'ICU LOS, mean (SD)',
+            **{n: summarize_continuous(g[g['had_icu']], 'icu_los_days') if g['had_icu'].sum() > 0 else 'N/A' for n, g in grps.items()}
+        })
         rws.append({'Variable': 'In-hospital death, n (%)', **{n: summarize_binary(g, 'in_hospital_death') for n, g in grps.items()}})
+
+        # Microbiology
+        rws.append({'Variable': '--- Microbiology ---', **{n: '' for n in grps}})
+        rws.append({'Variable': 'Positive blood cultures, mean (SD)', **{n: summarize_continuous(g, 'positive_culture_count') for n, g in grps.items()}})
+
+        # Index BC positivity - only for groups with presumed infection
+        pi_groups = {'Presumed Infection', 'ASE with Lactate', 'ASE without Lactate', 'Lactate-only ASE'}
+        row = {'Variable': 'Positive index BC, n (%)'}
+        for n, g in grps.items():
+            if n in pi_groups:
+                row[n] = summarize_binary(g, 'index_bc_positive')
+            else:
+                row[n] = 'N/A'
+        rws.append(row)
+
+        # BCs in index window - only for groups with presumed infection
+        row = {'Variable': 'BCs in index window, mean (SD)'}
+        for n, g in grps.items():
+            if n in pi_groups:
+                row[n] = summarize_continuous(g, 'bc_count_in_window')
+            else:
+                row[n] = 'N/A'
+        rws.append(row)
+
+        rws.append({
+            'Variable': 'Time to blood culture (hours), median (IQR)',
+            **{n: summarize_median_iqr(g, 'time_to_bc_hours') for n, g in grps.items()}
+        })
 
         return pd.DataFrame(rws)
 
@@ -958,14 +1349,16 @@ def _(mo):
 
 
 @app.cell
-def _(analysis_df):
+def _(analysis_df, sequence_summary):
     print("=" * 60)
     print("Table 1 Generation Complete")
     print("=" * 60)
     print(f"Total hospitalizations: {len(analysis_df):,}")
+    print(f"No presumed infection: {analysis_df['group_no_presumed_infection'].sum():,}")
     print(f"Presumed infection: {analysis_df['group_presumed_infection'].sum():,}")
     print(f"ASE with lactate: {analysis_df['group_ase_w_lactate'].sum():,}")
     print(f"ASE without lactate: {analysis_df['group_ase_wo_lactate'].sum():,}")
+    print(f"Lactate-only ASE: {analysis_df['group_lactate_only_ase'].sum():,}")
     if 'type' in analysis_df.columns:
         print(f"\nBy onset type:")
         print(f"  Community-onset: {(analysis_df['type'] == 'community').sum():,}")
