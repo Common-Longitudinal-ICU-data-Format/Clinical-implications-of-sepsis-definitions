@@ -277,14 +277,14 @@ def _(
 
     # Create aggregated transition counts for export (no PHI)
     transitions_w_lactate = []
-    for level in range(1, 6):  # 5 transitions for 6 levels
-        counts = sequence_w_lactate.groupby(
-            [f'level_{level}', f'level_{level+1}']
+    for _level in range(1, 6):  # 5 transitions for 6 levels
+        _counts = sequence_w_lactate.groupby(
+            [f'level_{_level}', f'level_{_level+1}']
         ).size().reset_index(name='count')
-        counts.columns = ['source_organ', 'target_organ', 'count']
-        counts['source_level'] = level
-        counts['target_level'] = level + 1
-        transitions_w_lactate.append(counts)
+        _counts.columns = ['source_organ', 'target_organ', 'count']
+        _counts['source_level'] = _level
+        _counts['target_level'] = _level + 1
+        transitions_w_lactate.append(_counts)
     sankey_w_lactate_data = pd.concat(transitions_w_lactate, ignore_index=True)
     sankey_w_lactate_data = sankey_w_lactate_data[['source_level', 'source_organ', 'target_level', 'target_organ', 'count']]
 
@@ -327,14 +327,14 @@ def _(
 
     # Create aggregated transition counts for export (no PHI)
     transitions_wo_lactate = []
-    for level in range(1, 5):  # 4 transitions for 5 levels
-        counts = sequence_wo_lactate.groupby(
-            [f'level_{level}', f'level_{level+1}']
+    for _level in range(1, 5):  # 4 transitions for 5 levels
+        _counts = sequence_wo_lactate.groupby(
+            [f'level_{_level}', f'level_{_level+1}']
         ).size().reset_index(name='count')
-        counts.columns = ['source_organ', 'target_organ', 'count']
-        counts['source_level'] = level
-        counts['target_level'] = level + 1
-        transitions_wo_lactate.append(counts)
+        _counts.columns = ['source_organ', 'target_organ', 'count']
+        _counts['source_level'] = _level
+        _counts['target_level'] = _level + 1
+        transitions_wo_lactate.append(_counts)
     sankey_wo_lactate_data = pd.concat(transitions_wo_lactate, ignore_index=True)
     sankey_wo_lactate_data = sankey_wo_lactate_data[['source_level', 'source_organ', 'target_level', 'target_organ', 'count']]
 
@@ -358,23 +358,22 @@ def _(go, pd):
     def create_qad_distribution(ase_df_with_lactate, ase_df_without_lactate, title="QAD Days Distribution"):
         """
         Create side-by-side bar chart comparing QAD distribution between ASE groups.
+        QAD ranges from 0 to 8 days.
         """
-        # Bin the QAD values
-        qad_with = ase_df_with_lactate['total_qad'].dropna()
-        qad_without = ase_df_without_lactate['total_qad'].dropna()
+        qad_with = ase_df_with_lactate['total_qad'].dropna().astype(int)
+        qad_without = ase_df_without_lactate['total_qad'].dropna().astype(int)
 
-        # Create bins (0-4, 5-7, 8-10, 11-14, 15+)
-        bins = [0, 4, 7, 10, 14, float('inf')]
-        labels = ['0-4', '5-7', '8-10', '11-14', '15+']
+        # Individual days 0-8
+        labels = list(range(0, 9))
 
-        with_counts = pd.cut(qad_with, bins=bins, labels=labels, right=True).value_counts().sort_index()
-        without_counts = pd.cut(qad_without, bins=bins, labels=labels, right=True).value_counts().sort_index()
+        with_counts = qad_with.value_counts().reindex(labels, fill_value=0).sort_index()
+        without_counts = qad_without.value_counts().reindex(labels, fill_value=0).sort_index()
 
         fig = go.Figure()
 
         # ASE with lactate
         fig.add_trace(go.Bar(
-            x=labels,
+            x=[str(l) for l in labels],
             y=[with_counts.get(l, 0) for l in labels],
             name='ASE with Lactate',
             marker_color='rgba(60, 179, 113, 0.8)'  # Medium sea green
@@ -382,7 +381,7 @@ def _(go, pd):
 
         # ASE without lactate
         fig.add_trace(go.Bar(
-            x=labels,
+            x=[str(l) for l in labels],
             y=[without_counts.get(l, 0) for l in labels],
             name='ASE without Lactate',
             marker_color='rgba(30, 144, 255, 0.8)'  # Dodger blue
@@ -415,17 +414,16 @@ def _(ase_df, create_qad_distribution, pd):
         title="QAD Days Distribution: ASE with vs without Lactate"
     )
 
-    # Create QAD data DataFrame for export
-    bins = [0, 4, 7, 10, 14, float('inf')]
-    labels = ['0-4', '5-7', '8-10', '11-14', '15+']
-    qad_with = ase_w_lactate_qad['total_qad'].dropna()
-    qad_without = ase_wo_lactate_qad['total_qad'].dropna()
-    with_counts = pd.cut(qad_with, bins=bins, labels=labels, right=True).value_counts().sort_index()
-    without_counts = pd.cut(qad_without, bins=bins, labels=labels, right=True).value_counts().sort_index()
+    # Create QAD data DataFrame for export (QAD ranges 0-8)
+    _qad_labels = list(range(0, 9))
+    _qad_with = ase_w_lactate_qad['total_qad'].dropna().astype(int)
+    _qad_without = ase_wo_lactate_qad['total_qad'].dropna().astype(int)
+    _with_counts = _qad_with.value_counts().reindex(_qad_labels, fill_value=0).sort_index()
+    _without_counts = _qad_without.value_counts().reindex(_qad_labels, fill_value=0).sort_index()
     qad_data_df = pd.DataFrame({
-        'qad_bin': labels,
-        'ase_with_lactate_count': [with_counts.get(l, 0) for l in labels],
-        'ase_without_lactate_count': [without_counts.get(l, 0) for l in labels]
+        'qad_days': _qad_labels,
+        'ase_with_lactate_count': [_with_counts.get(l, 0) for l in _qad_labels],
+        'ase_without_lactate_count': [_without_counts.get(l, 0) for l in _qad_labels]
     })
 
     # Print summary statistics

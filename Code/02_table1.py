@@ -318,10 +318,8 @@ def _(hosp_ids, micro, pd):
     micro_df = pd.merge(micro_df, culture_counts, on='hospitalization_id', how='left')
     micro_df['positive_culture_count'] = micro_df['positive_culture_count'].fillna(0).astype(int)
 
-    # Top 20 organisms
-    top_organisms = positive_cultures['organism_category'].value_counts().head(20)
     print(f"Microbiology computed: {(micro_df['positive_culture_count'] > 0).sum():,} patients with positive cultures")
-    return micro_df, top_organisms
+    return (micro_df,)
 
 
 @app.cell
@@ -490,7 +488,11 @@ def _(
 
     # NEW: No presumed infection and lactate-only ASE groups
     analysis_df['group_no_presumed_infection'] = analysis_df['presumed_infection'] == 0
-    analysis_df['group_lactate_only_ase'] = (analysis_df['sepsis'] == 1) & (analysis_df['ase_first_criteria_w_lactate'] == 'lactate')
+    analysis_df['group_lactate_only_ase'] = (
+        (analysis_df['sepsis'] == 1) &
+        (analysis_df['ase_first_criteria_w_lactate'] == 'lactate') &
+        (analysis_df['sepsis_wo_lactate'] == 0)
+    )
 
     # Merge all derived DataFrames
     analysis_df = analysis_df.merge(icu_df, on='hospitalization_id', how='left')
@@ -530,11 +532,13 @@ def _(
     analysis_df['had_hyperbili'] = analysis_df['hyperbilirubinemia_dttm'].notna()
     analysis_df['had_thrombocytopenia'] = analysis_df['thrombocytopenia_dttm'].notna()
     analysis_df['had_elevated_lactate'] = analysis_df['lactate_dttm'].notna()
+    analysis_df['had_vasopressor_ase'] = analysis_df['vasopressor_dttm'].notna()
+    analysis_df['had_imv_ase'] = analysis_df['imv_dttm'].notna()
 
     # Count of organ dysfunctions per patient (6 CDC criteria)
     analysis_df['organ_dysfunction_count'] = (
-        analysis_df['had_vasopressor'].astype(int) +
-        analysis_df['had_imv'].astype(int) +
+        analysis_df['had_vasopressor_ase'].astype(int) +
+        analysis_df['had_imv_ase'].astype(int) +
         analysis_df['had_aki'].astype(int) +
         analysis_df['had_hyperbili'].astype(int) +
         analysis_df['had_thrombocytopenia'].astype(int) +
@@ -561,6 +565,24 @@ def _(
         return None
 
     analysis_df['time_to_second_organ_hours'] = analysis_df.apply(time_to_second_organ, axis=1)
+
+    # Time from lactate (when it was first) to 2nd organ failure
+    def lactate_to_second_organ(row):
+        times = compute_organ_sequence(row, include_lactate=True)
+        if len(times) >= 2 and times[0][1] == 'lactate_dttm':
+            return (times[1][0] - times[0][0]).total_seconds() / 3600
+        return None
+
+    analysis_df['lactate_to_second_organ_hours'] = analysis_df.apply(lactate_to_second_organ, axis=1)
+
+    # Time from non-lactate first organ failure to 2nd organ failure
+    def non_lactate_to_second_organ(row):
+        times = compute_organ_sequence(row, include_lactate=True)
+        if len(times) >= 2 and times[0][1] != 'lactate_dttm':
+            return (times[1][0] - times[0][0]).total_seconds() / 3600
+        return None
+
+    analysis_df['non_lactate_to_second_organ_hours'] = analysis_df.apply(non_lactate_to_second_organ, axis=1)
 
     # Compute sequential time differences for CSV
     sequence_data = []
@@ -755,10 +777,10 @@ def _(
     # Define ASE-only groups (organ failure only relevant for these)
     ase_group_names = {'ASE with Lactate', 'ASE without Lactate', 'Lactate-only ASE'}
 
-    # All 6 CDC organ dysfunction criteria
+    # All 6 CDC organ dysfunction criteria (using ASE-criteria-specific indicators)
     organ_failure = [
-        ('had_vasopressor', 'Vasopressor'),
-        ('had_imv', 'IMV'),
+        ('had_vasopressor_ase', 'Vasopressor'),
+        ('had_imv_ase', 'IMV'),
         ('had_aki', 'AKI'),
         ('had_hyperbili', 'Hyperbilirubinemia'),
         ('had_thrombocytopenia', 'Thrombocytopenia'),
@@ -783,6 +805,15 @@ def _(
             row[nm] = 'N/A'
     table1_rows.append(row)
 
+    # Median organ dysfunction count - only for ASE groups
+    row = {'Variable': 'Organ dysfunctions, median (IQR)'}
+    for nm, df in groups.items():
+        if nm in ase_group_names:
+            row[nm] = summarize_median_iqr(df, 'organ_dysfunction_count')
+        else:
+            row[nm] = 'N/A'
+    table1_rows.append(row)
+
     # Time to first organ failure (also only for ASE groups)
     row = {'Variable': 'Time to first organ failure (hours), median (IQR)'}
     for nm, df in groups.items():
@@ -792,11 +823,81 @@ def _(
             row[nm] = 'N/A'
     table1_rows.append(row)
 
+    # Time to first organ failure mean
+    row = {'Variable': 'Time to first organ failure (hours), mean (SD)'}
+    for nm, df in groups.items():
+        if nm in ase_group_names:
+            vals = df['time_to_organ_failure_hours'].dropna()
+            row[nm] = f"{vals.mean():.1f} ({vals.std():.1f})" if len(vals) > 0 else 'N/A'
+        else:
+            row[nm] = 'N/A'
+    table1_rows.append(row)
+
     # Time to second organ failure (also only for ASE groups)
     row = {'Variable': 'Time to second organ failure (hours), median (IQR)'}
     for nm, df in groups.items():
         if nm in ase_group_names:
             row[nm] = summarize_median_iqr(df, 'time_to_second_organ_hours')
+        else:
+            row[nm] = 'N/A'
+    table1_rows.append(row)
+
+    # Time to second organ failure mean
+    row = {'Variable': 'Time to second organ failure (hours), mean (SD)'}
+    for nm, df in groups.items():
+        if nm in ase_group_names:
+            vals = df['time_to_second_organ_hours'].dropna()
+            row[nm] = f"{vals.mean():.1f} ({vals.std():.1f})" if len(vals) > 0 else 'N/A'
+        else:
+            row[nm] = 'N/A'
+    table1_rows.append(row)
+
+    # Lactate subgroup analysis - only for groups that include lactate
+    lactate_group_names = {'ASE with Lactate', 'Lactate-only ASE'}
+
+    # N where lactate was first ASE criterion
+    row = {'Variable': 'N 1st lactate ASE onsets, n (%)'}
+    for nm, df in groups.items():
+        if nm in lactate_group_names:
+            row[nm] = summarize_binary(df, df['ase_first_criteria_w_lactate'] == 'lactate')
+        else:
+            row[nm] = 'N/A'
+    table1_rows.append(row)
+
+    # Lactate to 2nd organ failure median
+    row = {'Variable': 'Lactate to 2nd organ failure (hours), median (IQR)'}
+    for nm, df in groups.items():
+        if nm in lactate_group_names:
+            row[nm] = summarize_median_iqr(df, 'lactate_to_second_organ_hours')
+        else:
+            row[nm] = 'N/A'
+    table1_rows.append(row)
+
+    # Lactate to 2nd organ failure mean
+    row = {'Variable': 'Lactate to 2nd organ failure (hours), mean (SD)'}
+    for nm, df in groups.items():
+        if nm in lactate_group_names:
+            vals = df['lactate_to_second_organ_hours'].dropna()
+            row[nm] = f"{vals.mean():.1f} ({vals.std():.1f})" if len(vals) > 0 else 'N/A'
+        else:
+            row[nm] = 'N/A'
+    table1_rows.append(row)
+
+    # Non-lactate 1st to 2nd organ failure median
+    row = {'Variable': 'Non-lactate 1st to 2nd organ failure (hours), median (IQR)'}
+    for nm, df in groups.items():
+        if nm in ase_group_names:
+            row[nm] = summarize_median_iqr(df, 'non_lactate_to_second_organ_hours')
+        else:
+            row[nm] = 'N/A'
+    table1_rows.append(row)
+
+    # Non-lactate 1st to 2nd organ failure mean
+    row = {'Variable': 'Non-lactate 1st to 2nd organ failure (hours), mean (SD)'}
+    for nm, df in groups.items():
+        if nm in ase_group_names:
+            vals = df['non_lactate_to_second_organ_hours'].dropna()
+            row[nm] = f"{vals.mean():.1f} ({vals.std():.1f})" if len(vals) > 0 else 'N/A'
         else:
             row[nm] = 'N/A'
     table1_rows.append(row)
@@ -896,16 +997,11 @@ def _(mo):
 
 
 @app.cell
-def _(OUTPUT_DIR, SITE_NAME, index_bc_organisms, sequence_summary, table1, top_organisms, window_bc_organisms):
+def _(OUTPUT_DIR, SITE_NAME, index_bc_organisms, sequence_summary, table1, window_bc_organisms):
     # Save main Table 1
     table1_path = OUTPUT_DIR / f"{SITE_NAME}_table1.csv"
     table1.to_csv(table1_path, index=False)
     print(f"Table 1 saved to: {table1_path}")
-
-    # Save top organisms (all positive cultures)
-    organisms_path = OUTPUT_DIR / f"{SITE_NAME}_top20_organisms.csv"
-    top_organisms.to_csv(organisms_path)
-    print(f"Top 20 organisms saved to: {organisms_path}")
 
     # Save index BC organisms (positive index blood cultures only)
     index_bc_org_path = OUTPUT_DIR / f"{SITE_NAME}_index_bc_top20_organisms.csv"
@@ -967,9 +1063,6 @@ def _(OUTPUT_DIR, SITE_NAME, analysis_df, pd, sequence_summary):
             'n_ASE_lactic_community': ((grp['group_ase_w_lactate']) & (grp['type'] == 'community')).sum(),
             'n_ASE_lactic_hospital': ((grp['group_ase_w_lactate']) & (grp['type'] == 'hospital')).sum(),
             'n_ASE_lactic_all': grp['group_ase_w_lactate'].sum(),
-            'n_BSE_community': None,  # BSE not implemented
-            'n_BSE_hospital': None,
-            'n_BSE_all': None,
             # Statistics
             'total_n_patients': len(grp),
             'female_allpatients_average': grp['is_female'].mean(),
@@ -1207,8 +1300,8 @@ def _(
         rws.append({'Variable': '--- Organ Failure (CDC) ---', **{n: '' for n in grps}})
         ase_group_names = {'ASE with Lactate', 'ASE without Lactate', 'Lactate-only ASE'}
         organ_failure = [
-            ('had_vasopressor', 'Vasopressor'),
-            ('had_imv', 'IMV'),
+            ('had_vasopressor_ase', 'Vasopressor'),
+            ('had_imv_ase', 'IMV'),
             ('had_aki', 'AKI'),
             ('had_hyperbili', 'Hyperbilirubinemia'),
             ('had_thrombocytopenia', 'Thrombocytopenia'),
@@ -1229,16 +1322,86 @@ def _(
                 row[n] = 'N/A'
         rws.append(row)
 
+        # Median organ dysfunction count - only for ASE groups
+        row = {'Variable': 'Organ dysfunctions, median (IQR)'}
+        for n, g in grps.items():
+            row[n] = summarize_median_iqr(g, 'organ_dysfunction_count') if n in ase_group_names else 'N/A'
+        rws.append(row)
+
         # Time to first organ failure (ASE groups only)
         row = {'Variable': 'Time to first organ failure (hours), median (IQR)'}
         for n, g in grps.items():
             row[n] = summarize_median_iqr(g, 'time_to_organ_failure_hours') if n in ase_group_names else 'N/A'
         rws.append(row)
 
+        # Time to first organ failure mean
+        row = {'Variable': 'Time to first organ failure (hours), mean (SD)'}
+        for n, g in grps.items():
+            if n in ase_group_names:
+                vals = g['time_to_organ_failure_hours'].dropna()
+                row[n] = f"{vals.mean():.1f} ({vals.std():.1f})" if len(vals) > 0 else 'N/A'
+            else:
+                row[n] = 'N/A'
+        rws.append(row)
+
         # Time to second organ failure (ASE groups only)
         row = {'Variable': 'Time to second organ failure (hours), median (IQR)'}
         for n, g in grps.items():
             row[n] = summarize_median_iqr(g, 'time_to_second_organ_hours') if n in ase_group_names else 'N/A'
+        rws.append(row)
+
+        # Time to second organ failure mean
+        row = {'Variable': 'Time to second organ failure (hours), mean (SD)'}
+        for n, g in grps.items():
+            if n in ase_group_names:
+                vals = g['time_to_second_organ_hours'].dropna()
+                row[n] = f"{vals.mean():.1f} ({vals.std():.1f})" if len(vals) > 0 else 'N/A'
+            else:
+                row[n] = 'N/A'
+        rws.append(row)
+
+        # Lactate subgroup analysis - only for groups that include lactate
+        lactate_group_names = {'ASE with Lactate', 'Lactate-only ASE'}
+
+        # N where lactate was first ASE criterion
+        row = {'Variable': 'N 1st lactate ASE onsets, n (%)'}
+        for n, g in grps.items():
+            if n in lactate_group_names:
+                row[n] = summarize_binary(g, g['ase_first_criteria_w_lactate'] == 'lactate')
+            else:
+                row[n] = 'N/A'
+        rws.append(row)
+
+        # Lactate to 2nd organ failure median
+        row = {'Variable': 'Lactate to 2nd organ failure (hours), median (IQR)'}
+        for n, g in grps.items():
+            row[n] = summarize_median_iqr(g, 'lactate_to_second_organ_hours') if n in lactate_group_names else 'N/A'
+        rws.append(row)
+
+        # Lactate to 2nd organ failure mean
+        row = {'Variable': 'Lactate to 2nd organ failure (hours), mean (SD)'}
+        for n, g in grps.items():
+            if n in lactate_group_names:
+                vals = g['lactate_to_second_organ_hours'].dropna()
+                row[n] = f"{vals.mean():.1f} ({vals.std():.1f})" if len(vals) > 0 else 'N/A'
+            else:
+                row[n] = 'N/A'
+        rws.append(row)
+
+        # Non-lactate 1st to 2nd organ failure median
+        row = {'Variable': 'Non-lactate 1st to 2nd organ failure (hours), median (IQR)'}
+        for n, g in grps.items():
+            row[n] = summarize_median_iqr(g, 'non_lactate_to_second_organ_hours') if n in ase_group_names else 'N/A'
+        rws.append(row)
+
+        # Non-lactate 1st to 2nd organ failure mean
+        row = {'Variable': 'Non-lactate 1st to 2nd organ failure (hours), mean (SD)'}
+        for n, g in grps.items():
+            if n in ase_group_names:
+                vals = g['non_lactate_to_second_organ_hours'].dropna()
+                row[n] = f"{vals.mean():.1f} ({vals.std():.1f})" if len(vals) > 0 else 'N/A'
+            else:
+                row[n] = 'N/A'
         rws.append(row)
 
         # First ASE Criteria (ASE groups only)
