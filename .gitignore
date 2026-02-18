@@ -3,3 +3,7 @@
 .pyc
 .DS_*
 clif_config.json
+*.py.json
+*.js
+*.pyc
+*.html

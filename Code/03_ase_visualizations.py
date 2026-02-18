@@ -354,7 +354,7 @@ def _(mo):
 
 
 @app.cell
-def _(go, pd):
+def _(go):
     def create_qad_distribution(ase_df_with_lactate, ase_df_without_lactate, title="QAD Days Distribution"):
         """
         Create side-by-side bar chart comparing QAD distribution between ASE groups.
@@ -439,145 +439,199 @@ def _(ase_df, create_qad_distribution, pd):
     print(f"  Range: {ase_wo_lactate_qad['total_qad'].min():.0f} - {ase_wo_lactate_qad['total_qad'].max():.0f}")
 
     qad_distribution
-    return qad_distribution, qad_data_df
+    return qad_data_df, qad_distribution
 
 
 @app.cell
 def _(mo):
     mo.md(r"""
-    ## Yearly ASE Cases
+    ## Monthly ASE Cases
 
-    Shows the yearly trend of ASE cases comparing with lactate vs without lactate criteria.
+    Shows the monthly trend of ASE cases comparing with lactate vs without lactate criteria.
     """)
     return
 
 
 @app.cell
 def _(ase_df, go, pd):
-    # Extract year from blood culture date
-    ase_yearly = ase_df.copy()
-    ase_yearly['year'] = pd.to_datetime(ase_yearly['blood_culture_dttm']).dt.year
+    # Extract year-month from blood culture date
+    ase_monthly = ase_df.copy()
+    ase_monthly['blood_culture_dttm'] = pd.to_datetime(ase_monthly['blood_culture_dttm'])
+    ase_monthly['year'] = ase_monthly['blood_culture_dttm'].dt.year
 
     # Filter to 2018-2024 only
-    ase_yearly = ase_yearly[(ase_yearly['year'] >= 2018) & (ase_yearly['year'] <= 2024)]
+    ase_monthly = ase_monthly[(ase_monthly['year'] >= 2018) & (ase_monthly['year'] <= 2024)]
+    ase_monthly['year_month'] = ase_monthly['blood_culture_dttm'].dt.to_period('M')
 
-    # Count cases per year
-    yearly_cases = ase_yearly.groupby('year').agg({
+    # Count cases per year-month
+    yearly_cases = ase_monthly.groupby('year_month').agg({
         'sepsis': 'sum',
         'sepsis_wo_lactate': 'sum'
     }).reset_index()
+    yearly_cases['year_month'] = yearly_cases['year_month'].astype(str)
 
     # Create line chart
     yearly_cases_fig = go.Figure()
 
     yearly_cases_fig.add_trace(go.Scatter(
-        x=yearly_cases['year'],
+        x=yearly_cases['year_month'],
         y=yearly_cases['sepsis'],
         mode='lines+markers',
         name='ASE with Lactate',
         line=dict(color='rgba(60, 179, 113, 1)', width=2),
-        marker=dict(size=8)
+        marker=dict(size=6)
     ))
 
     yearly_cases_fig.add_trace(go.Scatter(
-        x=yearly_cases['year'],
+        x=yearly_cases['year_month'],
         y=yearly_cases['sepsis_wo_lactate'],
         mode='lines+markers',
         name='ASE without Lactate',
         line=dict(color='rgba(30, 144, 255, 1)', width=2),
-        marker=dict(size=8)
+        marker=dict(size=6)
     ))
 
     yearly_cases_fig.update_layout(
-        title_text="Yearly ASE Cases: With vs Without Lactate",
-        xaxis_title="Year",
+        title_text="Monthly ASE Cases: With vs Without Lactate",
+        xaxis_title="Year-Month",
         yaxis_title="Number of Cases",
         height=500,
-        width=900,
+        width=1100,
         legend=dict(x=0.7, y=0.95),
-        xaxis=dict(dtick=1)
+        xaxis=dict(tickangle=-45)
     )
 
+    # Add percentage columns
+    for _col in ['sepsis', 'sepsis_wo_lactate']:
+        total = yearly_cases[_col].sum()
+        yearly_cases[f'{_col}_pct'] = (yearly_cases[_col] / total * 100).round(1) if total > 0 else 0.0
+
+    # Add totals row
+    totals = {'year_month': 'Total'}
+    for _col in ['sepsis', 'sepsis_wo_lactate']:
+        totals[_col] = yearly_cases[_col].sum()
+    for _col in ['sepsis_pct', 'sepsis_wo_lactate_pct']:
+        totals[_col] = 100.0
+    yearly_cases = pd.concat([yearly_cases, pd.DataFrame([totals])], ignore_index=True)
+
     # Print summary
-    print("Yearly ASE Cases Summary:")
+    print("Monthly ASE Cases Summary:")
     print(yearly_cases.to_string(index=False))
 
     yearly_cases_fig
-    return yearly_cases_fig, yearly_cases
+    return yearly_cases, yearly_cases_fig
 
 
 @app.cell
 def _(mo):
     mo.md(r"""
-    ## Yearly Organ Dysfunctions
+    ## Monthly Organ Dysfunctions
 
-    Shows the yearly trend of each organ dysfunction type among ASE patients.
+    Shows the monthly trend of each organ dysfunction type among ASE patients,
+    split into with-lactate and without-lactate definitions.
     """)
     return
 
 
 @app.cell
-def _(ORGAN_COLS_WITH_LACTATE, ase_df, go, pd):
-    # Extract year from blood culture date
-    ase_organs = ase_df.copy()
-    ase_organs['year'] = pd.to_datetime(ase_organs['blood_culture_dttm']).dt.year
-
-    # Filter to 2018-2024 only
-    ase_organs = ase_organs[(ase_organs['year'] >= 2018) & (ase_organs['year'] <= 2024)]
-
-    # Color map for organs (consistent with Sankey)
+def _(ORGAN_COLS_WITHOUT_LACTATE, ORGAN_COLS_WITH_LACTATE, ase_df, go, pd):
     organ_colors = {
-        'Vasopressor': 'rgba(255, 99, 71, 1)',      # Tomato red
-        'IMV': 'rgba(30, 144, 255, 1)',              # Dodger blue
-        'AKI': 'rgba(255, 165, 0, 1)',               # Orange
-        'Hyperbilirubinemia': 'rgba(255, 215, 0, 1)', # Gold
-        'Thrombocytopenia': 'rgba(147, 112, 219, 1)', # Medium purple
-        'Lactate': 'rgba(60, 179, 113, 1)'           # Medium sea green
+        'Vasopressor': 'rgba(255, 99, 71, 1)',
+        'IMV': 'rgba(30, 144, 255, 1)',
+        'AKI': 'rgba(255, 165, 0, 1)',
+        'Hyperbilirubinemia': 'rgba(255, 215, 0, 1)',
+        'Thrombocytopenia': 'rgba(147, 112, 219, 1)',
+        'Lactate': 'rgba(60, 179, 113, 1)'
     }
 
-    # Count each organ dysfunction per year
-    organ_yearly_data = []
-    for ocol, olabel in ORGAN_COLS_WITH_LACTATE.items():
-        yearly_counts = ase_organs.groupby('year')[ocol].apply(
-            lambda x: x.notna().sum()
-        ).reset_index()
-        yearly_counts.columns = ['year', 'count']
-        yearly_counts['organ'] = olabel
-        organ_yearly_data.append(yearly_counts)
+    def _build_organ_fig(df, organ_cols, title):
+        df = df.copy()
+        df['blood_culture_dttm'] = pd.to_datetime(df['blood_culture_dttm'])
+        df['year'] = df['blood_culture_dttm'].dt.year
+        df = df[(df['year'] >= 2018) & (df['year'] <= 2024)]
+        df['year_month'] = df['blood_culture_dttm'].dt.to_period('M')
 
-    organ_yearly_df = pd.concat(organ_yearly_data, ignore_index=True)
+        organ_data = []
+        for ocol, olabel in organ_cols.items():
+            monthly_counts = df.groupby('year_month')[ocol].apply(
+                lambda x: x.notna().sum()
+            ).reset_index()
+            monthly_counts.columns = ['year_month', 'count']
+            monthly_counts['organ'] = olabel
+            organ_data.append(monthly_counts)
 
-    # Create multi-line chart
-    yearly_organs_fig = go.Figure()
+        organ_df = pd.concat(organ_data, ignore_index=True)
 
-    for organ_col, organ_label in ORGAN_COLS_WITH_LACTATE.items():
-        organ_data = organ_yearly_df[organ_yearly_df['organ'] == organ_label]
-        yearly_organs_fig.add_trace(go.Scatter(
-            x=organ_data['year'],
-            y=organ_data['count'],
-            mode='lines+markers',
-            name=organ_label,
-            line=dict(color=organ_colors.get(organ_label, 'gray'), width=2),
-            marker=dict(size=6)
-        ))
+        fig = go.Figure()
+        for organ_col, organ_label in organ_cols.items():
+            odata = organ_df[organ_df['organ'] == organ_label]
+            fig.add_trace(go.Scatter(
+                x=odata['year_month'].astype(str),
+                y=odata['count'],
+                mode='lines+markers',
+                name=organ_label,
+                line=dict(color=organ_colors.get(organ_label, 'gray'), width=2),
+                marker=dict(size=6)
+            ))
+        fig.update_layout(
+            title_text=title,
+            xaxis_title="Year-Month",
+            yaxis_title="Number of Cases",
+            height=500, width=1100,
+            legend=dict(x=0.85, y=0.95),
+            xaxis=dict(tickangle=-45)
+        )
 
-    yearly_organs_fig.update_layout(
-        title_text="Yearly Organ Dysfunctions in ASE Patients",
-        xaxis_title="Year",
-        yaxis_title="Number of Cases",
-        height=500,
-        width=900,
-        legend=dict(x=0.85, y=0.95),
-        xaxis=dict(dtick=1)
+        # Pivot for export
+        pivot = organ_df.pivot(index='year_month', columns='organ', values='count').fillna(0).reset_index()
+        pivot['year_month'] = pivot['year_month'].astype(str)
+
+        # Percentage columns
+        organ_labels = list(organ_cols.values())
+        for col in organ_labels:
+            if col in pivot.columns:
+                total = pivot[col].sum()
+                pivot[f'{col}_pct'] = (pivot[col] / total * 100).round(1) if total > 0 else 0.0
+
+        # Totals row
+        totals = {'year_month': 'Total'}
+        for col in organ_labels:
+            if col in pivot.columns:
+                totals[col] = pivot[col].sum()
+        for col in organ_labels:
+            pct_col = f'{col}_pct'
+            if pct_col in pivot.columns:
+                totals[pct_col] = 100.0
+        pivot = pd.concat([pivot, pd.DataFrame([totals])], ignore_index=True)
+
+        return fig, pivot
+
+    # WITH lactate
+    organ_monthly_w_fig, organ_monthly_w_pivot = _build_organ_fig(
+        ase_df[ase_df['sepsis'] == 1],
+        ORGAN_COLS_WITH_LACTATE,
+        "Monthly Organ Dysfunctions — WITH Lactate"
     )
 
-    # Create pivot table for export
-    organ_yearly_pivot = organ_yearly_df.pivot(index='year', columns='organ', values='count').reset_index()
-    print("Yearly Organ Dysfunctions Summary:")
-    print(organ_yearly_pivot.to_string(index=False))
+    # WITHOUT lactate
+    organ_monthly_wo_fig, organ_monthly_wo_pivot = _build_organ_fig(
+        ase_df[ase_df['sepsis_wo_lactate'] == 1],
+        ORGAN_COLS_WITHOUT_LACTATE,
+        "Monthly Organ Dysfunctions — WITHOUT Lactate"
+    )
 
-    yearly_organs_fig
-    return yearly_organs_fig, organ_yearly_pivot
+    print("WITH Lactate organs:")
+    print(organ_monthly_w_pivot.to_string(index=False))
+    print("\nWITHOUT Lactate organs:")
+    print(organ_monthly_wo_pivot.to_string(index=False))
+
+    organ_monthly_w_fig
+    return (
+        organ_monthly_w_fig,
+        organ_monthly_w_pivot,
+        organ_monthly_wo_fig,
+        organ_monthly_wo_pivot,
+    )
 
 
 @app.cell
@@ -585,64 +639,81 @@ def _(mo):
     mo.md(r"""
     ## Yearly ASE by Onset Type
 
-    Shows the yearly trend of ASE cases by onset type (Hospital vs Community).
+    Shows the yearly trend of ASE cases by onset type (Hospital vs Community),
+    split into two plots: one for ASE **with** lactate and one **without** lactate.
     """)
     return
 
 
 @app.cell
 def _(ase_df, go, pd):
-    # Filter to ASE cases only and extract year
-    ase_onset = ase_df[ase_df['sepsis'] == 1].copy()
-    ase_onset['year'] = pd.to_datetime(ase_onset['blood_culture_dttm']).dt.year
+    def _build_onset_fig(df, title):
+        """Build a community vs hospital onset line chart from filtered ASE df."""
+        df = df.copy()
+        df['blood_culture_dttm'] = pd.to_datetime(df['blood_culture_dttm'])
+        df['year_month'] = df['blood_culture_dttm'].dt.to_period('M')
+        monthly = df.groupby(['year_month', 'type']).size().reset_index(name='count')
+        pivot = monthly.pivot(index='year_month', columns='type', values='count').fillna(0)
+        pivot.index = pivot.index.astype(str)
 
-    # Filter to 2018-2024 only
-    ase_onset = ase_onset[(ase_onset['year'] >= 2018) & (ase_onset['year'] <= 2024)]
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(
+            x=pivot.index, y=pivot.get('community', [0]*len(pivot)),
+            mode='lines+markers', name='Community Onset',
+            line=dict(color='rgba(30, 144, 255, 1)', width=2), marker=dict(size=8)
+        ))
+        fig.add_trace(go.Scatter(
+            x=pivot.index, y=pivot.get('hospital', [0]*len(pivot)),
+            mode='lines+markers', name='Hospital Onset',
+            line=dict(color='rgba(255, 99, 71, 1)', width=2), marker=dict(size=8)
+        ))
+        fig.update_layout(
+            title_text=title, xaxis_title="Year-Month", yaxis_title="Number of Cases",
+            height=500, width=1100, legend=dict(x=0.7, y=0.95), xaxis=dict(tickangle=-45)
+        )
+        result = pivot.reset_index()
 
-    # Count by onset type per year
-    yearly_onset = ase_onset.groupby(['year', 'type']).size().reset_index(name='count')
-    yearly_onset_pivot = yearly_onset.pivot(index='year', columns='type', values='count').fillna(0)
+        # Add percentage columns (each column sums to 100%)
+        for col in ['community', 'hospital']:
+            if col in result.columns:
+                total = result[col].sum()
+                result[f'{col}_pct'] = (result[col] / total * 100).round(1) if total > 0 else 0.0
 
-    # Create line chart
-    yearly_onset_fig = go.Figure()
+        # Add totals row
+        totals = {'year_month': 'Total'}
+        for col in ['community', 'hospital']:
+            if col in result.columns:
+                totals[col] = result[col].sum()
+        for col in ['community_pct', 'hospital_pct']:
+            if col in result.columns:
+                totals[col] = 100.0
+        result = pd.concat([result, pd.DataFrame([totals])], ignore_index=True)
 
-    yearly_onset_fig.add_trace(go.Scatter(
-        x=yearly_onset_pivot.index,
-        y=yearly_onset_pivot.get('community', [0] * len(yearly_onset_pivot)),
-        mode='lines+markers',
-        name='Community Onset',
-        line=dict(color='rgba(30, 144, 255, 1)', width=2),
-        marker=dict(size=8)
-    ))
+        return fig, result
 
-    yearly_onset_fig.add_trace(go.Scatter(
-        x=yearly_onset_pivot.index,
-        y=yearly_onset_pivot.get('hospital', [0] * len(yearly_onset_pivot)),
-        mode='lines+markers',
-        name='Hospital Onset',
-        line=dict(color='rgba(255, 99, 71, 1)', width=2),
-        marker=dict(size=8)
-    ))
-
-    yearly_onset_fig.update_layout(
-        title_text="Yearly ASE Cases: Community vs Hospital Onset",
-        xaxis_title="Year",
-        yaxis_title="Number of Cases",
-        height=500,
-        width=900,
-        legend=dict(x=0.7, y=0.95),
-        xaxis=dict(dtick=1)
+    # ASE WITH lactate
+    yearly_onset_w_fig, yearly_onset_w_data = _build_onset_fig(
+        ase_df[ase_df['sepsis'] == 1],
+        "Monthly ASE Cases by Onset Type — WITH Lactate"
+    )
+    # ASE WITHOUT lactate
+    yearly_onset_wo_fig, yearly_onset_wo_data = _build_onset_fig(
+        ase_df[ase_df['sepsis_wo_lactate'] == 1],
+        "Monthly ASE Cases by Onset Type — WITHOUT Lactate"
     )
 
-    # Print summary
-    print("Yearly ASE by Onset Type Summary:")
-    print(yearly_onset_pivot.to_string())
+    print("WITH Lactate onset:")
+    print(yearly_onset_w_data.to_string(index=False))
+    print("\nWITHOUT Lactate onset:")
+    print(yearly_onset_wo_data.to_string(index=False))
 
-    # Reset index for export
-    yearly_onset_data = yearly_onset_pivot.reset_index()
-
-    yearly_onset_fig
-    return yearly_onset_fig, yearly_onset_data
+    yearly_onset_w_fig
+    return (
+        yearly_onset_w_data,
+        yearly_onset_w_fig,
+        yearly_onset_wo_data,
+        yearly_onset_wo_fig,
+    )
 
 
 @app.cell
@@ -657,7 +728,10 @@ def _(mo):
 def _(
     OUTPUT_DIR,
     SITE_NAME,
-    organ_yearly_pivot,
+    organ_monthly_w_fig,
+    organ_monthly_w_pivot,
+    organ_monthly_wo_fig,
+    organ_monthly_wo_pivot,
     qad_data_df,
     qad_distribution,
     sankey_w_lactate,
@@ -666,9 +740,10 @@ def _(
     sankey_wo_lactate_data,
     yearly_cases,
     yearly_cases_fig,
-    yearly_onset_data,
-    yearly_onset_fig,
-    yearly_organs_fig,
+    yearly_onset_w_data,
+    yearly_onset_w_fig,
+    yearly_onset_wo_data,
+    yearly_onset_wo_fig,
 ):
     # Create subdirectories for plots and data
     PLOTS_DIR = OUTPUT_DIR / "plots"
@@ -712,23 +787,41 @@ def _(
     yearly_cases_fig.write_image(str(yearly_cases_png))
     print(f"Saved: {yearly_cases_png}")
 
-    # Save yearly organs plot
-    yearly_organs_html = PLOTS_DIR / f"{SITE_NAME}_yearly_organs.html"
-    yearly_organs_fig.write_html(str(yearly_organs_html))
-    print(f"Saved: {yearly_organs_html}")
+    # Save monthly organs WITH lactate
+    organ_w_html = PLOTS_DIR / f"{SITE_NAME}_monthly_organs_w_lactate.html"
+    organ_monthly_w_fig.write_html(str(organ_w_html))
+    print(f"Saved: {organ_w_html}")
 
-    yearly_organs_png = PLOTS_DIR / f"{SITE_NAME}_yearly_organs.png"
-    yearly_organs_fig.write_image(str(yearly_organs_png))
-    print(f"Saved: {yearly_organs_png}")
+    organ_w_png = PLOTS_DIR / f"{SITE_NAME}_monthly_organs_w_lactate.png"
+    organ_monthly_w_fig.write_image(str(organ_w_png))
+    print(f"Saved: {organ_w_png}")
 
-    # Save yearly onset type plot
-    yearly_onset_html = PLOTS_DIR / f"{SITE_NAME}_yearly_onset.html"
-    yearly_onset_fig.write_html(str(yearly_onset_html))
-    print(f"Saved: {yearly_onset_html}")
+    # Save monthly organs WITHOUT lactate
+    organ_wo_html = PLOTS_DIR / f"{SITE_NAME}_monthly_organs_wo_lactate.html"
+    organ_monthly_wo_fig.write_html(str(organ_wo_html))
+    print(f"Saved: {organ_wo_html}")
 
-    yearly_onset_png = PLOTS_DIR / f"{SITE_NAME}_yearly_onset.png"
-    yearly_onset_fig.write_image(str(yearly_onset_png))
-    print(f"Saved: {yearly_onset_png}")
+    organ_wo_png = PLOTS_DIR / f"{SITE_NAME}_monthly_organs_wo_lactate.png"
+    organ_monthly_wo_fig.write_image(str(organ_wo_png))
+    print(f"Saved: {organ_wo_png}")
+
+    # Save monthly onset WITH lactate
+    yearly_onset_w_html = PLOTS_DIR / f"{SITE_NAME}_monthly_onset_w_lactate.html"
+    yearly_onset_w_fig.write_html(str(yearly_onset_w_html))
+    print(f"Saved: {yearly_onset_w_html}")
+
+    yearly_onset_w_png = PLOTS_DIR / f"{SITE_NAME}_monthly_onset_w_lactate.png"
+    yearly_onset_w_fig.write_image(str(yearly_onset_w_png))
+    print(f"Saved: {yearly_onset_w_png}")
+
+    # Save monthly onset WITHOUT lactate
+    yearly_onset_wo_html = PLOTS_DIR / f"{SITE_NAME}_monthly_onset_wo_lactate.html"
+    yearly_onset_wo_fig.write_html(str(yearly_onset_wo_html))
+    print(f"Saved: {yearly_onset_wo_html}")
+
+    yearly_onset_wo_png = PLOTS_DIR / f"{SITE_NAME}_monthly_onset_wo_lactate.png"
+    yearly_onset_wo_fig.write_image(str(yearly_onset_wo_png))
+    print(f"Saved: {yearly_onset_wo_png}")
 
     print("\n--- Plots saved ---")
 
@@ -749,13 +842,21 @@ def _(
     yearly_cases.to_csv(str(yearly_cases_csv), index=False)
     print(f"Saved: {yearly_cases_csv}")
 
-    yearly_organs_csv = DATA_DIR / f"{SITE_NAME}_yearly_organs_data.csv"
-    organ_yearly_pivot.to_csv(str(yearly_organs_csv), index=False)
-    print(f"Saved: {yearly_organs_csv}")
+    organ_w_csv = DATA_DIR / f"{SITE_NAME}_monthly_organs_w_lactate_data.csv"
+    organ_monthly_w_pivot.to_csv(str(organ_w_csv), index=False)
+    print(f"Saved: {organ_w_csv}")
 
-    yearly_onset_csv = DATA_DIR / f"{SITE_NAME}_yearly_onset_data.csv"
-    yearly_onset_data.to_csv(str(yearly_onset_csv), index=False)
-    print(f"Saved: {yearly_onset_csv}")
+    organ_wo_csv = DATA_DIR / f"{SITE_NAME}_monthly_organs_wo_lactate_data.csv"
+    organ_monthly_wo_pivot.to_csv(str(organ_wo_csv), index=False)
+    print(f"Saved: {organ_wo_csv}")
+
+    yearly_onset_w_csv = DATA_DIR / f"{SITE_NAME}_monthly_onset_w_lactate_data.csv"
+    yearly_onset_w_data.to_csv(str(yearly_onset_w_csv), index=False)
+    print(f"Saved: {yearly_onset_w_csv}")
+
+    yearly_onset_wo_csv = DATA_DIR / f"{SITE_NAME}_monthly_onset_wo_lactate_data.csv"
+    yearly_onset_wo_data.to_csv(str(yearly_onset_wo_csv), index=False)
+    print(f"Saved: {yearly_onset_wo_csv}")
 
     print("\n--- Data CSVs saved ---")
     print("\nAll outputs saved successfully!")
@@ -784,15 +885,15 @@ def _(
 
     print("\nASE WITH Lactate:")
     print(f"  Total patients: {len(ase_w_lactate_df):,}")
-    for col, label in ORGAN_COLS_WITH_LACTATE.items():
-        count = ase_w_lactate_df[col].notna().sum()
+    for _col, label in ORGAN_COLS_WITH_LACTATE.items():
+        count = ase_w_lactate_df[_col].notna().sum()
         pct = 100 * count / len(ase_w_lactate_df) if len(ase_w_lactate_df) > 0 else 0
         print(f"  {label}: {count:,} ({pct:.1f}%)")
 
     print("\nASE WITHOUT Lactate:")
     print(f"  Total patients: {len(ase_wo_lactate_df):,}")
-    for col, label in ORGAN_COLS_WITHOUT_LACTATE.items():
-        count = ase_wo_lactate_df[col].notna().sum()
+    for _col, label in ORGAN_COLS_WITHOUT_LACTATE.items():
+        count = ase_wo_lactate_df[_col].notna().sum()
         pct = 100 * count / len(ase_wo_lactate_df) if len(ase_wo_lactate_df) > 0 else 0
         print(f"  {label}: {count:,} ({pct:.1f}%)")
 

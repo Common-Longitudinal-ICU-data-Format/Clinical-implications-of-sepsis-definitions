@@ -131,10 +131,14 @@ def _(merged_df):
 
 @app.cell
 def _(cohort_df):
-    # Filter 2: Date range 2018-2024
+    # Filter 2: Date range 2018-2024 + non-null dates
     cohort_df_filtered = cohort_df[
+        (cohort_df["admission_dttm"].notna()) &
+        (cohort_df["discharge_dttm"].notna()) &
         (cohort_df["admission_dttm"].dt.year >= 2018) &
-        (cohort_df["admission_dttm"].dt.year <= 2024)
+        (cohort_df["admission_dttm"].dt.year <= 2024) &
+        (cohort_df["discharge_dttm"].dt.year >= 2018) &
+        (cohort_df["discharge_dttm"].dt.year <= 2024)
     ].copy()
 
     print(f"After date filter (2018-2024): {cohort_df_filtered['hospitalization_id'].nunique():,} hospitalizations")
@@ -196,6 +200,28 @@ def _(cohort_df_final, patient, pd):
     print("Final Cohort Summary:")
     print(f"  Hospitalizations: {final_cohort['hospitalization_id'].nunique():,}")
     print(f"  Unique patients: {final_cohort['patient_id'].nunique():,}")
+
+    # Create combined race/ethnicity column
+    def get_race_ethnicity(row):
+        race = row["race_category"]
+        eth = row["ethnicity_category"]
+        if race == "Asian":
+            return "Asian"
+        elif eth == "Hispanic" and race == "Black or African American":
+            return "Hispanic Black"
+        elif eth == "Hispanic" and race == "White":
+            return "Hispanic White"
+        elif eth == "Non-Hispanic" and race == "Black or African American":
+            return "Non-Hispanic Black"
+        elif eth == "Non-Hispanic" and race == "White":
+            return "Non-Hispanic White"
+        else:
+            return "Other"
+
+    final_cohort["race_ethnicity"] = final_cohort.apply(get_race_ethnicity, axis=1)
+
+    print("\nRace/Ethnicity distribution:")
+    print(final_cohort["race_ethnicity"].value_counts())
     return (final_cohort,)
 
 
@@ -206,6 +232,8 @@ def _(final_cohort):
     print(f"  Age: mean={final_cohort['age_at_admission'].mean():.1f}, median={final_cohort['age_at_admission'].median():.1f}")
     print("Sex distribution:")
     print(final_cohort["sex_category"].value_counts())
+    print("Race/Ethnicity distribution:")
+    print(final_cohort["race_ethnicity"].value_counts())
     print("Hospital type distribution:")
     print(final_cohort["hospital_type"].value_counts())
     return
@@ -328,11 +356,6 @@ def _(OUTPUT_DIR, SITE_NAME, ase_results):
 def _(ase_results):
     # Display ASE results
     ase_results
-    return
-
-
-@app.cell
-def _():
     return
 
 
