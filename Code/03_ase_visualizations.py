@@ -25,6 +25,8 @@ def _(mo):
     4. **Yearly cases plot** - Line chart of ASE cases by year
     5. **Yearly organ dysfunctions plot** - Multi-line chart of organ failures by year
     6. **Yearly onset type plot** - Line chart of Hospital vs Community onset by year
+    7. **Yearly ED hospitalizations summary** - Descriptive statistics of yearly ED visits by hospital
+    8. **Top 20 QAD antimicrobials** - Frequency tables of most common antimicrobials in QAD runs
     """)
     return
 
@@ -35,7 +37,11 @@ def _():
     import pandas as pd
     from pathlib import Path
     import plotly.graph_objects as go
-    return Path, go, json, pd
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from clifpy.tables import Labs
+    return Labs, Path, go, json, matplotlib, pd, plt
 
 
 @app.cell
@@ -44,24 +50,120 @@ def _(Path, json):
     config_path = Path("clif_config.json")
     config = json.loads(config_path.read_text())
 
+    CLIF_DATA_DIR = Path(config["data_directory"])
+    FILETYPE = config["filetype"]
+    TIMEZONE = config["timezone"]
     OUTPUT_DIR = Path(config["output_directory"])
+    PHI_DIR = Path(config["phi_directory"])
     SITE_NAME = config["site_name"]
 
     print(f"Site: {SITE_NAME}")
     print(f"Output directory: {OUTPUT_DIR}")
-    return OUTPUT_DIR, SITE_NAME
+    print(f"PHI directory: {PHI_DIR}")
+    print(f"CLIF data directory: {CLIF_DATA_DIR}")
+    return CLIF_DATA_DIR, FILETYPE, OUTPUT_DIR, PHI_DIR, SITE_NAME, TIMEZONE
 
 
 @app.cell
-def _(OUTPUT_DIR, SITE_NAME, pd):
-    # Load ASE results from cohort_df.py output
-    ase_results_path = OUTPUT_DIR / f"{SITE_NAME}_ase_results.parquet"
+def _(PHI_DIR, SITE_NAME, pd):
+    # Load ASE results from cohort notebook (PHI data)
+    ase_results_path = PHI_DIR / f"{SITE_NAME}_ase_results.parquet"
     ase_df = pd.read_parquet(ase_results_path)
 
     print(f"Loaded ASE results: {len(ase_df):,} records")
     print(f"ASE with lactate (sepsis=1): {ase_df['sepsis'].sum():,}")
     print(f"ASE without lactate (sepsis_wo_lactate=1): {ase_df['sepsis_wo_lactate'].sum():,}")
     return (ase_df,)
+
+
+@app.cell
+def _(PHI_DIR, SITE_NAME, pd):
+    cohort_df = pd.read_parquet(
+        PHI_DIR / f"{SITE_NAME}_cohort_df.parquet",
+        columns=["hospitalization_id", "hospital_id", "hospital_type", "admission_dttm"]
+    ).drop_duplicates(subset=["hospitalization_id"])
+    print(f"Loaded cohort: {len(cohort_df):,} hospitalizations")
+    return (cohort_df,)
+
+
+@app.cell
+def _(mo):
+    mo.md(r"""
+    ## Yearly ED Hospitalizations by Hospital
+
+    Since the entire cohort is ED-admitted, this section summarizes the average
+    yearly adult hospitalizations from the ED, stratified by hospital and hospital type.
+    Descriptive statistics (mean, SD, median, IQR) of yearly ED visit counts are reported.
+    """)
+    return
+
+
+@app.cell
+def _(cohort_df, pd, mo):
+    import numpy as np
+
+    # Derive year from admission datetime
+    _cohort = cohort_df.copy()
+    _cohort["year"] = pd.to_datetime(_cohort["admission_dttm"]).dt.year
+
+    # Count hospitalizations per (year, hospital_id, hospital_type)
+    yearly_hosp_counts = (
+        _cohort.groupby(["year", "hospital_id", "hospital_type"])
+        .size()
+        .reset_index(name="n_hospitalizations")
+    )
+
+    # Summary stats per (hospital_id, hospital_type)
+    def _summary(group):
+        return pd.Series({
+            "mean": group["n_hospitalizations"].mean(),
+            "sd": group["n_hospitalizations"].std(),
+            "median": group["n_hospitalizations"].median(),
+            "q1": group["n_hospitalizations"].quantile(0.25),
+            "q3": group["n_hospitalizations"].quantile(0.75),
+            "n_years": len(group),
+        })
+
+    hospital_summary = (
+        yearly_hosp_counts
+        .groupby(["hospital_id", "hospital_type"])
+        .apply(_summary)
+        .reset_index()
+    )
+
+    # Overall summary (all hospitals combined per year)
+    yearly_totals = (
+        _cohort.groupby("year")
+        .size()
+        .reset_index(name="n_hospitalizations")
+    )
+    overall_row = pd.DataFrame([{
+        "hospital_id": "Overall",
+        "hospital_type": "All",
+        "mean": yearly_totals["n_hospitalizations"].mean(),
+        "sd": yearly_totals["n_hospitalizations"].std(),
+        "median": yearly_totals["n_hospitalizations"].median(),
+        "q1": yearly_totals["n_hospitalizations"].quantile(0.25),
+        "q3": yearly_totals["n_hospitalizations"].quantile(0.75),
+        "n_years": len(yearly_totals),
+    }])
+
+    yearly_ed_summary = pd.concat([hospital_summary, overall_row], ignore_index=True)
+
+    # Round for display
+    for _col in ["mean", "sd", "median", "q1", "q3"]:
+        yearly_ed_summary[_col] = yearly_ed_summary[_col].round(1)
+
+    print("Yearly ED Hospitalizations — Summary Statistics")
+    print("=" * 70)
+    print(yearly_ed_summary.to_string(index=False))
+    print(f"\nYears covered: {sorted(_cohort['year'].unique())}")
+
+    mo.md(f"""
+    ### Summary Table
+    {mo.as_html(yearly_ed_summary)}
+    """)
+    return yearly_hosp_counts, yearly_ed_summary
 
 
 @app.cell
@@ -445,6 +547,64 @@ def _(ase_df, create_qad_distribution, pd):
 @app.cell
 def _(mo):
     mo.md(r"""
+    ## Top 20 QAD Antimicrobials
+
+    Frequency table of the most common antimicrobials contributing to
+    Qualifying Antimicrobial Days (QADs) in ASE episodes, for both
+    with-lactate and without-lactate definitions.
+    """)
+    return
+
+
+@app.cell
+def _(ase_df, mo, pd):
+    def _top20_with_other(series):
+        """From an exploded med Series, return top-20 + Other DataFrame."""
+        counts = series.value_counts()
+        top20 = counts.head(20)
+        other_count = counts.iloc[20:].sum() if len(counts) > 20 else 0
+        result = top20.reset_index()
+        result.columns = ["antimicrobial", "count"]
+        if other_count > 0:
+            result = pd.concat(
+                [result, pd.DataFrame([{"antimicrobial": "Other", "count": other_count}])],
+                ignore_index=True,
+            )
+        total = result["count"].sum()
+        result["pct"] = (result["count"] / total * 100).round(1)
+        return result
+
+    # --- ASE WITH lactate ---
+    ase_w_meds = ase_df.loc[ase_df["sepsis"] == 1, "run_meds"].dropna()
+    exploded_w = ase_w_meds.str.split(", ").explode()
+    top20_meds_w_lactate = _top20_with_other(exploded_w)
+
+    # --- ASE WITHOUT lactate ---
+    ase_wo_meds = ase_df.loc[ase_df["sepsis_wo_lactate"] == 1, "run_meds"].dropna()
+    exploded_wo = ase_wo_meds.str.split(", ").explode()
+    top20_meds_wo_lactate = _top20_with_other(exploded_wo)
+
+    print("Top 20 QAD Antimicrobials — WITH Lactate")
+    print("=" * 50)
+    print(top20_meds_w_lactate.to_string(index=False))
+
+    print(f"\nTop 20 QAD Antimicrobials — WITHOUT Lactate")
+    print("=" * 50)
+    print(top20_meds_wo_lactate.to_string(index=False))
+
+    mo.md(f"""
+    ### ASE WITH Lactate
+    {mo.as_html(top20_meds_w_lactate)}
+
+    ### ASE WITHOUT Lactate
+    {mo.as_html(top20_meds_wo_lactate)}
+    """)
+    return top20_meds_w_lactate, top20_meds_wo_lactate
+
+
+@app.cell
+def _(mo):
+    mo.md(r"""
     ## Monthly ASE Cases
 
     Shows the monthly trend of ASE cases comparing with lactate vs without lactate criteria.
@@ -501,17 +661,18 @@ def _(ase_df, go, pd):
         xaxis=dict(tickangle=-45)
     )
 
-    # Add percentage columns
+    # Add percentage columns (row-wise: each row sums to 100%)
+    _row_total = yearly_cases['sepsis'] + yearly_cases['sepsis_wo_lactate']
     for _col in ['sepsis', 'sepsis_wo_lactate']:
-        total = yearly_cases[_col].sum()
-        yearly_cases[f'{_col}_pct'] = (yearly_cases[_col] / total * 100).round(1) if total > 0 else 0.0
+        yearly_cases[f'{_col}_pct'] = (yearly_cases[_col] / _row_total.replace(0, float('nan')) * 100).round(1).fillna(0.0)
 
     # Add totals row
     totals = {'year_month': 'Total'}
     for _col in ['sepsis', 'sepsis_wo_lactate']:
         totals[_col] = yearly_cases[_col].sum()
-    for _col in ['sepsis_pct', 'sepsis_wo_lactate_pct']:
-        totals[_col] = 100.0
+    _total_sum = totals['sepsis'] + totals['sepsis_wo_lactate']
+    for _col in ['sepsis', 'sepsis_wo_lactate']:
+        totals[f'{_col}_pct'] = round(totals[_col] / _total_sum * 100, 1) if _total_sum > 0 else 0.0
     yearly_cases = pd.concat([yearly_cases, pd.DataFrame([totals])], ignore_index=True)
 
     # Print summary
@@ -586,22 +747,23 @@ def _(ORGAN_COLS_WITHOUT_LACTATE, ORGAN_COLS_WITH_LACTATE, ase_df, go, pd):
         pivot = organ_df.pivot(index='year_month', columns='organ', values='count').fillna(0).reset_index()
         pivot['year_month'] = pivot['year_month'].astype(str)
 
-        # Percentage columns
+        # Percentage columns (row-wise: each row sums to 100%)
         organ_labels = list(organ_cols.values())
+        _present_cols = [c for c in organ_labels if c in pivot.columns]
+        _row_total = pivot[_present_cols].sum(axis=1)
         for col in organ_labels:
             if col in pivot.columns:
-                total = pivot[col].sum()
-                pivot[f'{col}_pct'] = (pivot[col] / total * 100).round(1) if total > 0 else 0.0
+                pivot[f'{col}_pct'] = (pivot[col] / _row_total.replace(0, float('nan')) * 100).round(1).fillna(0.0)
 
         # Totals row
         totals = {'year_month': 'Total'}
         for col in organ_labels:
             if col in pivot.columns:
                 totals[col] = pivot[col].sum()
+        _total_sum = sum(totals.get(col, 0) for col in _present_cols)
         for col in organ_labels:
-            pct_col = f'{col}_pct'
-            if pct_col in pivot.columns:
-                totals[pct_col] = 100.0
+            if col in pivot.columns:
+                totals[f'{col}_pct'] = round(totals[col] / _total_sum * 100, 1) if _total_sum > 0 else 0.0
         pivot = pd.concat([pivot, pd.DataFrame([totals])], ignore_index=True)
 
         return fig, pivot
@@ -673,20 +835,20 @@ def _(ase_df, go, pd):
         )
         result = pivot.reset_index()
 
-        # Add percentage columns (each column sums to 100%)
-        for col in ['community', 'hospital']:
-            if col in result.columns:
-                total = result[col].sum()
-                result[f'{col}_pct'] = (result[col] / total * 100).round(1) if total > 0 else 0.0
+        # Add percentage columns (row-wise: each row sums to 100%)
+        _onset_cols = [c for c in ['community', 'hospital'] if c in result.columns]
+        _row_total = result[_onset_cols].sum(axis=1)
+        for col in _onset_cols:
+            result[f'{col}_pct'] = (result[col] / _row_total.replace(0, float('nan')) * 100).round(1).fillna(0.0)
 
         # Add totals row
         totals = {'year_month': 'Total'}
         for col in ['community', 'hospital']:
             if col in result.columns:
                 totals[col] = result[col].sum()
-        for col in ['community_pct', 'hospital_pct']:
-            if col in result.columns:
-                totals[col] = 100.0
+        _total_sum = sum(totals.get(col, 0) for col in _onset_cols)
+        for col in _onset_cols:
+            totals[f'{col}_pct'] = round(totals[col] / _total_sum * 100, 1) if _total_sum > 0 else 0.0
         result = pd.concat([result, pd.DataFrame([totals])], ignore_index=True)
 
         return fig, result
@@ -719,6 +881,157 @@ def _(ase_df, go, pd):
 @app.cell
 def _(mo):
     mo.md(r"""
+    ## Monthly Lactate Lab Counts by Hospital
+
+    Lactate lab counts from the CLIF labs table, stratified by hospital ID and hospital type.
+    """)
+    return
+
+
+@app.cell
+def _(CLIF_DATA_DIR, FILETYPE, Labs, TIMEZONE, cohort_df, pd):
+    # Load lactate labs for cohort hospitalizations
+    lactate_labs = Labs.from_file(
+        data_directory=str(CLIF_DATA_DIR),
+        filetype=FILETYPE,
+        timezone=TIMEZONE,
+        filters={
+            'hospitalization_id': cohort_df['hospitalization_id'].tolist(),
+            'lab_category': ['lactate']
+        },
+        columns=['hospitalization_id', 'lab_result_dttm']
+    )
+    lactate_df = lactate_labs.df.copy()
+
+    # Join with cohort for hospital info
+    lactate_df = lactate_df.merge(cohort_df, on='hospitalization_id', how='inner')
+
+    # Derive year_month and filter to 2018-2024
+    lactate_df['lab_result_dttm'] = pd.to_datetime(lactate_df['lab_result_dttm'])
+    lactate_df['year'] = lactate_df['lab_result_dttm'].dt.year
+    lactate_df = lactate_df[(lactate_df['year'] >= 2018) & (lactate_df['year'] <= 2024)]
+    lactate_df['year_month'] = lactate_df['lab_result_dttm'].dt.to_period('M').astype(str)
+
+    # Count lactate labs per year_month, hospital_id, hospital_type
+    lactate_counts = (
+        lactate_df
+        .groupby(['year_month', 'hospital_id', 'hospital_type'])
+        .size()
+        .reset_index(name='lactate_count')
+        .sort_values('year_month')
+    )
+
+    # Add totals row per hospital
+    _totals = lactate_counts.groupby(['hospital_id', 'hospital_type'])['lactate_count'].sum().reset_index()
+    _totals['year_month'] = 'Total'
+    lactate_counts = pd.concat([lactate_counts, _totals], ignore_index=True)
+
+    print("Lactate Lab Counts by Year-Month and Hospital:")
+    print(lactate_counts.to_string(index=False))
+
+    return lactate_counts, lactate_df
+
+
+@app.cell
+def _(mo):
+    mo.md(r"""
+    ## Lactate Orders During QADs by Health System
+
+    Monthly trends in the number of lactate lab orders that fall within QAD
+    (Qualifying Antimicrobial Day) windows, stratified by hospital/health system.
+    This narrows the lactate counts to only those ordered during active antibiotic
+    treatment windows for ASE episodes.
+    """)
+    return
+
+
+@app.cell
+def _(ase_df, cohort_df, go, lactate_df, pd):
+    def _build_qad_lactate_trend(ase_subset, lactate_df_full, cohort, title):
+        """Build monthly lactate-during-QAD trend by hospital for an ASE subset."""
+        # Keep episodes with a QAD window
+        qad_eps = ase_subset[ase_subset['qad_start_date'].notna()][
+            ['hospitalization_id', 'qad_start_date', 'qad_end_date']
+        ].copy()
+        qad_eps['qad_start_date'] = pd.to_datetime(qad_eps['qad_start_date']).dt.date
+        qad_eps['qad_end_date'] = pd.to_datetime(qad_eps['qad_end_date']).dt.date
+
+        # Merge with cohort for hospital_id
+        qad_eps = qad_eps.merge(
+            cohort[['hospitalization_id', 'hospital_id']], on='hospitalization_id', how='inner'
+        )
+
+        # Inner join with lactate labs on hospitalization_id
+        merged = qad_eps.merge(lactate_df_full[['hospitalization_id', 'lab_result_dttm']], on='hospitalization_id', how='inner')
+
+        # Filter lactates to within the QAD window
+        merged['lab_date'] = pd.to_datetime(merged['lab_result_dttm']).dt.date
+        merged = merged[(merged['lab_date'] >= merged['qad_start_date']) & (merged['lab_date'] <= merged['qad_end_date'])]
+
+        # Derive year_month, filter 2018-2024
+        merged['lab_result_dttm'] = pd.to_datetime(merged['lab_result_dttm'])
+        merged['year'] = merged['lab_result_dttm'].dt.year
+        merged = merged[(merged['year'] >= 2018) & (merged['year'] <= 2024)]
+        merged['year_month'] = merged['lab_result_dttm'].dt.to_period('M').astype(str)
+
+        # Group by year_month + hospital_id
+        counts = (
+            merged.groupby(['year_month', 'hospital_id'])
+            .size()
+            .reset_index(name='lactate_during_qad_count')
+            .sort_values('year_month')
+        )
+
+        # Build Plotly line chart — one trace per hospital
+        fig = go.Figure()
+        for hosp in sorted(counts['hospital_id'].unique()):
+            hdata = counts[counts['hospital_id'] == hosp]
+            fig.add_trace(go.Scatter(
+                x=hdata['year_month'],
+                y=hdata['lactate_during_qad_count'],
+                mode='lines+markers',
+                name=str(hosp),
+                marker=dict(size=5),
+            ))
+        fig.update_layout(
+            title_text=title,
+            xaxis_title="Year-Month",
+            yaxis_title="Lactate Orders During QADs",
+            height=500, width=1100,
+            legend=dict(x=0.85, y=0.95),
+            xaxis=dict(tickangle=-45),
+        )
+
+        return fig, counts
+
+    # ASE WITH lactate (sepsis == 1)
+    qad_lactate_w_fig, qad_lactate_w_data = _build_qad_lactate_trend(
+        ase_df[ase_df['sepsis'] == 1],
+        lactate_df,
+        cohort_df,
+        "Monthly Lactate Orders During QADs — ASE WITH Lactate",
+    )
+
+    # ASE WITHOUT lactate (sepsis_wo_lactate == 1)
+    qad_lactate_wo_fig, qad_lactate_wo_data = _build_qad_lactate_trend(
+        ase_df[ase_df['sepsis_wo_lactate'] == 1],
+        lactate_df,
+        cohort_df,
+        "Monthly Lactate Orders During QADs — ASE WITHOUT Lactate",
+    )
+
+    print("QAD Lactate Trend — WITH Lactate:")
+    print(qad_lactate_w_data.to_string(index=False))
+    print(f"\nQAD Lactate Trend — WITHOUT Lactate:")
+    print(qad_lactate_wo_data.to_string(index=False))
+
+    qad_lactate_w_fig
+    return qad_lactate_w_data, qad_lactate_w_fig, qad_lactate_wo_data, qad_lactate_wo_fig
+
+
+@app.cell
+def _(mo):
+    mo.md(r"""
     ## Save Outputs
     """)
     return
@@ -728,22 +1041,32 @@ def _(mo):
 def _(
     OUTPUT_DIR,
     SITE_NAME,
+    lactate_counts,
     organ_monthly_w_fig,
     organ_monthly_w_pivot,
     organ_monthly_wo_fig,
     organ_monthly_wo_pivot,
+    plt,
     qad_data_df,
     qad_distribution,
+    qad_lactate_w_data,
+    qad_lactate_w_fig,
+    qad_lactate_wo_data,
+    qad_lactate_wo_fig,
     sankey_w_lactate,
     sankey_w_lactate_data,
     sankey_wo_lactate,
     sankey_wo_lactate_data,
+    top20_meds_w_lactate,
+    top20_meds_wo_lactate,
     yearly_cases,
     yearly_cases_fig,
     yearly_onset_w_data,
     yearly_onset_w_fig,
     yearly_onset_wo_data,
     yearly_onset_wo_fig,
+    yearly_hosp_counts,
+    yearly_ed_summary,
 ):
     # Create subdirectories for plots and data
     PLOTS_DIR = OUTPUT_DIR / "plots"
@@ -760,22 +1083,28 @@ def _(
     sankey_wo_lactate.write_html(str(sankey_wo_lactate_path))
     print(f"Saved: {sankey_wo_lactate_path}")
 
-    # Save Sankey plots as PNG (requires kaleido package)
-    sankey_w_lactate_png = PLOTS_DIR / f"{SITE_NAME}_sankey_ase_w_lactate.png"
-    sankey_w_lactate.write_image(str(sankey_w_lactate_png))
-    print(f"Saved: {sankey_w_lactate_png}")
-
-    sankey_wo_lactate_png = PLOTS_DIR / f"{SITE_NAME}_sankey_ase_wo_lactate.png"
-    sankey_wo_lactate.write_image(str(sankey_wo_lactate_png))
-    print(f"Saved: {sankey_wo_lactate_png}")
-
     # Save QAD distribution plot
     qad_html_path = PLOTS_DIR / f"{SITE_NAME}_qad_distribution.html"
     qad_distribution.write_html(str(qad_html_path))
     print(f"Saved: {qad_html_path}")
 
     qad_png_path = PLOTS_DIR / f"{SITE_NAME}_qad_distribution.png"
-    qad_distribution.write_image(str(qad_png_path))
+    fig, ax = plt.subplots(figsize=(9, 5))
+    x_labels = qad_data_df["qad_days"].astype(str)
+    x = range(len(x_labels))
+    w = 0.35
+    ax.bar([i - w / 2 for i in x], qad_data_df["ase_with_lactate_count"], w,
+           label="ASE with Lactate", color=(60/255, 179/255, 113/255, 0.8))
+    ax.bar([i + w / 2 for i in x], qad_data_df["ase_without_lactate_count"], w,
+           label="ASE without Lactate", color=(30/255, 144/255, 255/255, 0.8))
+    ax.set_xticks(list(x))
+    ax.set_xticklabels(x_labels)
+    ax.set_xlabel("QAD Days")
+    ax.set_ylabel("Count")
+    ax.set_title("QAD Days Distribution: ASE with vs without Lactate")
+    ax.legend(loc="upper right")
+    fig.savefig(str(qad_png_path), dpi=150, bbox_inches="tight")
+    plt.close(fig)
     print(f"Saved: {qad_png_path}")
 
     # Save yearly cases plot
@@ -784,7 +1113,21 @@ def _(
     print(f"Saved: {yearly_cases_html}")
 
     yearly_cases_png = PLOTS_DIR / f"{SITE_NAME}_yearly_cases.png"
-    yearly_cases_fig.write_image(str(yearly_cases_png))
+    yc = yearly_cases[yearly_cases["year_month"] != "Total"]
+    fig, ax = plt.subplots(figsize=(11, 5))
+    ax.plot(yc["year_month"], yc["sepsis"], marker="o", markersize=4,
+            label="ASE with Lactate", color=(60/255, 179/255, 113/255))
+    ax.plot(yc["year_month"], yc["sepsis_wo_lactate"], marker="o", markersize=4,
+            label="ASE without Lactate", color=(30/255, 144/255, 255/255))
+    ax.set_xlabel("Year-Month")
+    ax.set_ylabel("Number of Cases")
+    ax.set_title("Monthly ASE Cases: With vs Without Lactate")
+    ax.legend(loc="upper right")
+    ax.tick_params(axis="x", rotation=45)
+    nth = max(1, len(yc) // 12)
+    ax.set_xticks(yc["year_month"].values[::nth])
+    fig.savefig(str(yearly_cases_png), dpi=150, bbox_inches="tight")
+    plt.close(fig)
     print(f"Saved: {yearly_cases_png}")
 
     # Save monthly organs WITH lactate
@@ -793,7 +1136,28 @@ def _(
     print(f"Saved: {organ_w_html}")
 
     organ_w_png = PLOTS_DIR / f"{SITE_NAME}_monthly_organs_w_lactate.png"
-    organ_monthly_w_fig.write_image(str(organ_w_png))
+    _organ_colors = {
+        "Vasopressor": (255/255, 99/255, 71/255),
+        "IMV": (30/255, 144/255, 255/255),
+        "AKI": (255/255, 165/255, 0/255),
+        "Hyperbilirubinemia": (255/255, 215/255, 0/255),
+        "Thrombocytopenia": (147/255, 112/255, 219/255),
+        "Lactate": (60/255, 179/255, 113/255),
+    }
+    ow = organ_monthly_w_pivot[organ_monthly_w_pivot["year_month"] != "Total"]
+    fig, ax = plt.subplots(figsize=(11, 5))
+    for _col in [c for c in ow.columns if c != "year_month" and "_pct" not in c]:
+        ax.plot(ow["year_month"], ow[_col], marker="o", markersize=4,
+                label=_col, color=_organ_colors.get(_col, "gray"))
+    ax.set_xlabel("Year-Month")
+    ax.set_ylabel("Number of Cases")
+    ax.set_title("Monthly Organ Dysfunctions — WITH Lactate")
+    ax.legend(loc="upper right", fontsize="small")
+    ax.tick_params(axis="x", rotation=45)
+    nth = max(1, len(ow) // 12)
+    ax.set_xticks(ow["year_month"].values[::nth])
+    fig.savefig(str(organ_w_png), dpi=150, bbox_inches="tight")
+    plt.close(fig)
     print(f"Saved: {organ_w_png}")
 
     # Save monthly organs WITHOUT lactate
@@ -802,7 +1166,20 @@ def _(
     print(f"Saved: {organ_wo_html}")
 
     organ_wo_png = PLOTS_DIR / f"{SITE_NAME}_monthly_organs_wo_lactate.png"
-    organ_monthly_wo_fig.write_image(str(organ_wo_png))
+    owo = organ_monthly_wo_pivot[organ_monthly_wo_pivot["year_month"] != "Total"]
+    fig, ax = plt.subplots(figsize=(11, 5))
+    for _col in [c for c in owo.columns if c != "year_month" and "_pct" not in c]:
+        ax.plot(owo["year_month"], owo[_col], marker="o", markersize=4,
+                label=_col, color=_organ_colors.get(_col, "gray"))
+    ax.set_xlabel("Year-Month")
+    ax.set_ylabel("Number of Cases")
+    ax.set_title("Monthly Organ Dysfunctions — WITHOUT Lactate")
+    ax.legend(loc="upper right", fontsize="small")
+    ax.tick_params(axis="x", rotation=45)
+    nth = max(1, len(owo) // 12)
+    ax.set_xticks(owo["year_month"].values[::nth])
+    fig.savefig(str(organ_wo_png), dpi=150, bbox_inches="tight")
+    plt.close(fig)
     print(f"Saved: {organ_wo_png}")
 
     # Save monthly onset WITH lactate
@@ -811,7 +1188,23 @@ def _(
     print(f"Saved: {yearly_onset_w_html}")
 
     yearly_onset_w_png = PLOTS_DIR / f"{SITE_NAME}_monthly_onset_w_lactate.png"
-    yearly_onset_w_fig.write_image(str(yearly_onset_w_png))
+    yw = yearly_onset_w_data[yearly_onset_w_data["year_month"] != "Total"]
+    fig, ax = plt.subplots(figsize=(11, 5))
+    if "community" in yw.columns:
+        ax.plot(yw["year_month"], yw["community"], marker="o", markersize=6,
+                label="Community Onset", color=(30/255, 144/255, 255/255))
+    if "hospital" in yw.columns:
+        ax.plot(yw["year_month"], yw["hospital"], marker="o", markersize=6,
+                label="Hospital Onset", color=(255/255, 99/255, 71/255))
+    ax.set_xlabel("Year-Month")
+    ax.set_ylabel("Number of Cases")
+    ax.set_title("Monthly ASE Cases by Onset Type — WITH Lactate")
+    ax.legend(loc="upper right")
+    ax.tick_params(axis="x", rotation=45)
+    nth = max(1, len(yw) // 12)
+    ax.set_xticks(yw["year_month"].values[::nth])
+    fig.savefig(str(yearly_onset_w_png), dpi=150, bbox_inches="tight")
+    plt.close(fig)
     print(f"Saved: {yearly_onset_w_png}")
 
     # Save monthly onset WITHOUT lactate
@@ -820,7 +1213,23 @@ def _(
     print(f"Saved: {yearly_onset_wo_html}")
 
     yearly_onset_wo_png = PLOTS_DIR / f"{SITE_NAME}_monthly_onset_wo_lactate.png"
-    yearly_onset_wo_fig.write_image(str(yearly_onset_wo_png))
+    ywo = yearly_onset_wo_data[yearly_onset_wo_data["year_month"] != "Total"]
+    fig, ax = plt.subplots(figsize=(11, 5))
+    if "community" in ywo.columns:
+        ax.plot(ywo["year_month"], ywo["community"], marker="o", markersize=6,
+                label="Community Onset", color=(30/255, 144/255, 255/255))
+    if "hospital" in ywo.columns:
+        ax.plot(ywo["year_month"], ywo["hospital"], marker="o", markersize=6,
+                label="Hospital Onset", color=(255/255, 99/255, 71/255))
+    ax.set_xlabel("Year-Month")
+    ax.set_ylabel("Number of Cases")
+    ax.set_title("Monthly ASE Cases by Onset Type — WITHOUT Lactate")
+    ax.legend(loc="upper right")
+    ax.tick_params(axis="x", rotation=45)
+    nth = max(1, len(ywo) // 12)
+    ax.set_xticks(ywo["year_month"].values[::nth])
+    fig.savefig(str(yearly_onset_wo_png), dpi=150, bbox_inches="tight")
+    plt.close(fig)
     print(f"Saved: {yearly_onset_wo_png}")
 
     print("\n--- Plots saved ---")
@@ -857,6 +1266,78 @@ def _(
     yearly_onset_wo_csv = DATA_DIR / f"{SITE_NAME}_monthly_onset_wo_lactate_data.csv"
     yearly_onset_wo_data.to_csv(str(yearly_onset_wo_csv), index=False)
     print(f"Saved: {yearly_onset_wo_csv}")
+
+    lactate_csv = DATA_DIR / f"{SITE_NAME}_lactate_counts_by_hospital.csv"
+    lactate_counts.to_csv(str(lactate_csv), index=False)
+    print(f"Saved: {lactate_csv}")
+
+    # Save QAD lactate trend — WITH lactate
+    qad_lac_w_html = PLOTS_DIR / f"{SITE_NAME}_qad_lactate_trend_w_lactate.html"
+    qad_lactate_w_fig.write_html(str(qad_lac_w_html))
+    print(f"Saved: {qad_lac_w_html}")
+
+    qad_lac_w_png = PLOTS_DIR / f"{SITE_NAME}_qad_lactate_trend_w_lactate.png"
+    _qlw = qad_lactate_w_data.copy()
+    fig, ax = plt.subplots(figsize=(11, 5))
+    for hosp in sorted(_qlw['hospital_id'].unique()):
+        hd = _qlw[_qlw['hospital_id'] == hosp]
+        ax.plot(hd['year_month'], hd['lactate_during_qad_count'], marker='o', markersize=4, label=str(hosp))
+    ax.set_xlabel("Year-Month")
+    ax.set_ylabel("Lactate Orders During QADs")
+    ax.set_title("Monthly Lactate Orders During QADs — ASE WITH Lactate")
+    ax.legend(loc="upper right", fontsize="small")
+    ax.tick_params(axis="x", rotation=45)
+    nth = max(1, len(_qlw['year_month'].unique()) // 12)
+    ax.set_xticks(_qlw['year_month'].unique()[::nth])
+    fig.savefig(str(qad_lac_w_png), dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Saved: {qad_lac_w_png}")
+
+    qad_lac_w_csv = DATA_DIR / f"{SITE_NAME}_qad_lactate_trend_w_lactate_data.csv"
+    qad_lactate_w_data.to_csv(str(qad_lac_w_csv), index=False)
+    print(f"Saved: {qad_lac_w_csv}")
+
+    # Save QAD lactate trend — WITHOUT lactate
+    qad_lac_wo_html = PLOTS_DIR / f"{SITE_NAME}_qad_lactate_trend_wo_lactate.html"
+    qad_lactate_wo_fig.write_html(str(qad_lac_wo_html))
+    print(f"Saved: {qad_lac_wo_html}")
+
+    qad_lac_wo_png = PLOTS_DIR / f"{SITE_NAME}_qad_lactate_trend_wo_lactate.png"
+    _qlwo = qad_lactate_wo_data.copy()
+    fig, ax = plt.subplots(figsize=(11, 5))
+    for hosp in sorted(_qlwo['hospital_id'].unique()):
+        hd = _qlwo[_qlwo['hospital_id'] == hosp]
+        ax.plot(hd['year_month'], hd['lactate_during_qad_count'], marker='o', markersize=4, label=str(hosp))
+    ax.set_xlabel("Year-Month")
+    ax.set_ylabel("Lactate Orders During QADs")
+    ax.set_title("Monthly Lactate Orders During QADs — ASE WITHOUT Lactate")
+    ax.legend(loc="upper right", fontsize="small")
+    ax.tick_params(axis="x", rotation=45)
+    nth = max(1, len(_qlwo['year_month'].unique()) // 12)
+    ax.set_xticks(_qlwo['year_month'].unique()[::nth])
+    fig.savefig(str(qad_lac_wo_png), dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Saved: {qad_lac_wo_png}")
+
+    qad_lac_wo_csv = DATA_DIR / f"{SITE_NAME}_qad_lactate_trend_wo_lactate_data.csv"
+    qad_lactate_wo_data.to_csv(str(qad_lac_wo_csv), index=False)
+    print(f"Saved: {qad_lac_wo_csv}")
+
+    yearly_ed_hosp_csv = DATA_DIR / f"{SITE_NAME}_yearly_ed_hospitalizations.csv"
+    yearly_hosp_counts.to_csv(str(yearly_ed_hosp_csv), index=False)
+    print(f"Saved: {yearly_ed_hosp_csv}")
+
+    yearly_ed_summary_csv = DATA_DIR / f"{SITE_NAME}_yearly_ed_summary_stats.csv"
+    yearly_ed_summary.to_csv(str(yearly_ed_summary_csv), index=False)
+    print(f"Saved: {yearly_ed_summary_csv}")
+
+    top20_meds_w_csv = DATA_DIR / f"{SITE_NAME}_top20_qad_meds_w_lactate.csv"
+    top20_meds_w_lactate.to_csv(str(top20_meds_w_csv), index=False)
+    print(f"Saved: {top20_meds_w_csv}")
+
+    top20_meds_wo_csv = DATA_DIR / f"{SITE_NAME}_top20_qad_meds_wo_lactate.csv"
+    top20_meds_wo_lactate.to_csv(str(top20_meds_wo_csv), index=False)
+    print(f"Saved: {top20_meds_wo_csv}")
 
     print("\n--- Data CSVs saved ---")
     print("\nAll outputs saved successfully!")

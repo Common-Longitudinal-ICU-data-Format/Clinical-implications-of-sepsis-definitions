@@ -47,13 +47,18 @@ def _(Path, json):
     FILETYPE = config["filetype"]
     TIMEZONE = config["timezone"]
     OUTPUT_DIR = Path(config["output_directory"])
+    PHI_DIR = Path(config["phi_directory"])
     SITE_NAME = config["site_name"]
+
+    # Create both output directories
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    PHI_DIR.mkdir(parents=True, exist_ok=True)
 
     print(f"Site: {SITE_NAME}")
     print(f"Data directory: {DATA_DIR}")
     print(f"Filetype: {FILETYPE}")
     print(f"Timezone: {TIMEZONE}")
-    return DATA_DIR, FILETYPE, OUTPUT_DIR, SITE_NAME, TIMEZONE
+    return DATA_DIR, FILETYPE, OUTPUT_DIR, PHI_DIR, SITE_NAME, TIMEZONE
 
 
 @app.cell
@@ -248,12 +253,9 @@ def _(mo):
 
 
 @app.cell
-def _(OUTPUT_DIR, SITE_NAME, final_cohort):
-    # Create output directory
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-
-    # Save cohort
-    cohort_output_path = OUTPUT_DIR / f"{SITE_NAME}_cohort_df.parquet"
+def _(PHI_DIR, SITE_NAME, final_cohort):
+    # Save cohort (PHI - patient-level data)
+    cohort_output_path = PHI_DIR / f"{SITE_NAME}_cohort_df.parquet"
     final_cohort.to_parquet(cohort_output_path, index=False)
 
     print(f"Cohort saved to: {cohort_output_path}")
@@ -342,9 +344,9 @@ def _(mo):
 
 
 @app.cell
-def _(OUTPUT_DIR, SITE_NAME, ase_results):
-    # Save ASE results
-    ase_output_path = OUTPUT_DIR / f"{SITE_NAME}_ase_results.parquet"
+def _(PHI_DIR, SITE_NAME, ase_results):
+    # Save ASE results (PHI - patient-level data)
+    ase_output_path = PHI_DIR / f"{SITE_NAME}_ase_results.parquet"
     ase_results.to_parquet(ase_output_path, index=False)
 
     print(f"ASE results saved to: {ase_output_path}")

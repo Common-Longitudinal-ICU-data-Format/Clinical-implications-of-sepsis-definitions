@@ -1,5 +1,7 @@
 *.logs
 /output
+/output_PHI
+/output_to_BOX
 .pyc
 .DS_*
 clif_config.json
@@ -7,3 +9,4 @@ clif_config.json
 *.js
 *.pyc
 *.html
+*.log

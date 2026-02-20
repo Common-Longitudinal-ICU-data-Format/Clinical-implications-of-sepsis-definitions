@@ -60,11 +60,12 @@ def _(Path, json):
     FILETYPE = config["filetype"]
     TIMEZONE = config["timezone"]
     OUTPUT_DIR = Path(config["output_directory"])
+    PHI_DIR = Path(config["phi_directory"])
     SITE_NAME = config["site_name"]
 
     print(f"Site: {SITE_NAME}")
     print(f"Data directory: {DATA_DIR}")
-    return DATA_DIR, FILETYPE, OUTPUT_DIR, SITE_NAME, TIMEZONE
+    return DATA_DIR, FILETYPE, OUTPUT_DIR, PHI_DIR, SITE_NAME, TIMEZONE
 
 
 @app.cell
@@ -76,10 +77,10 @@ def _(mo):
 
 
 @app.cell
-def _(OUTPUT_DIR, SITE_NAME, pd):
-    # Load cohort and ASE results from notebook 1
-    cohort_df = pd.read_parquet(OUTPUT_DIR / f"{SITE_NAME}_cohort_df.parquet")
-    ase_df = pd.read_parquet(OUTPUT_DIR / f"{SITE_NAME}_ase_results.parquet")
+def _(PHI_DIR, SITE_NAME, pd):
+    # Load cohort and ASE results from notebook 1 (PHI data)
+    cohort_df = pd.read_parquet(PHI_DIR / f"{SITE_NAME}_cohort_df.parquet")
+    ase_df = pd.read_parquet(PHI_DIR / f"{SITE_NAME}_ase_results.parquet")
 
     # Get hosp_ids from base cohort
     hosp_ids = cohort_df['hospitalization_id'].astype(str).unique().tolist()
@@ -237,14 +238,14 @@ def _(adt, hosp_ids, pd):
     hosp_with_any_icu = set(icu_stays['hospitalization_id'].unique())
     icu_df['had_icu'] = icu_df['hospitalization_id'].isin(hosp_with_any_icu)
 
-    # ICU types - vectorized
-    icu_types_list = ['cardiac_icu', 'neuro_icu', 'surgical_icu', 'medical_icu', 'general_icu']
-    for_icu_type = {t: set(icu_stays[icu_stays['location_type'] == t]['hospitalization_id'].unique()) for t in icu_types_list}
-    icu_df['icu_cardiac_icu'] = icu_df['hospitalization_id'].isin(for_icu_type.get('cardiac_icu', set()))
-    icu_df['icu_neuro_icu'] = icu_df['hospitalization_id'].isin(for_icu_type.get('neuro_icu', set()))
-    icu_df['icu_surgical_icu'] = icu_df['hospitalization_id'].isin(for_icu_type.get('surgical_icu', set()))
-    icu_df['icu_medical_icu'] = icu_df['hospitalization_id'].isin(for_icu_type.get('medical_icu', set()))
-    icu_df['icu_general_icu'] = icu_df['hospitalization_id'].isin(for_icu_type.get('general_icu', set()))
+    # ICU types - dynamically detect all types present in the data
+    # Deduplicate: each ICU type counted at most once per hospitalization
+    icu_deduped = icu_stays[['hospitalization_id', 'location_type']].drop_duplicates()
+    icu_types_in_data = sorted(icu_deduped['location_type'].dropna().unique().tolist())
+
+    for icu_type in icu_types_in_data:
+        hosp_with_type = set(icu_deduped[icu_deduped['location_type'] == icu_type]['hospitalization_id'])
+        icu_df[icu_type] = icu_df['hospitalization_id'].isin(hosp_with_type)
 
     # First ICU time
     first_icu = icu_stays.groupby('hospitalization_id')['in_dttm'].min().reset_index()
@@ -513,7 +514,7 @@ def _(
     analysis_df = analysis_df.merge(first_vital_df, on='hospitalization_id', how='left')
     analysis_df = analysis_df.merge(index_bc_df, on='hospitalization_id', how='left')
 
-    # Compute time to first organ failure (hours from first vital)
+    # Compute time from admission to first organ failure
     organ_failure_cols = ['aki_dttm', 'vasopressor_dttm', 'hyperbilirubinemia_dttm',
                           'thrombocytopenia_dttm', 'lactate_dttm', 'imv_dttm']
     # Convert to datetime if needed
@@ -521,13 +522,14 @@ def _(
         if col in analysis_df.columns:
             analysis_df[col] = pd.to_datetime(analysis_df[col], errors='coerce')
     analysis_df['first_vital_dttm'] = pd.to_datetime(analysis_df['first_vital_dttm'], errors='coerce')
+    analysis_df['admission_dttm'] = pd.to_datetime(analysis_df['admission_dttm'], errors='coerce')
 
     # Get earliest organ failure datetime per patient
     analysis_df['first_organ_failure_dttm'] = analysis_df[organ_failure_cols].min(axis=1)
 
-    # Calculate hours from first vital to first organ failure
+    # Calculate hours from admission to first organ failure
     analysis_df['time_to_organ_failure_hours'] = (
-        (analysis_df['first_organ_failure_dttm'] - analysis_df['first_vital_dttm']).dt.total_seconds() / 3600
+        (analysis_df['first_organ_failure_dttm'] - analysis_df['admission_dttm']).dt.total_seconds() / 3600
     )
 
     # Fill NaN values
@@ -805,10 +807,9 @@ def _():
 
             # ICU
             g["binary"]["had_icu"] = binary(df, "had_icu")
-            for icu_col in ['icu_cardiac_icu', 'icu_neuro_icu', 'icu_surgical_icu',
-                            'icu_medical_icu', 'icu_general_icu']:
-                if icu_col in df.columns:
-                    g["binary"][icu_col] = binary(df, icu_col)
+            icu_type_cols = sorted([c for c in df.columns if c.endswith('_icu') and c not in ('had_icu',)])
+            for icu_col in icu_type_cols:
+                g["binary"][icu_col] = binary(df, icu_col)
             icu_sub = df[df['had_icu']]
             g["continuous"]["icu_los_days"] = cont(icu_sub, "icu_los_days") if len(icu_sub) > 0 else None
 
@@ -953,7 +954,7 @@ def _(
     table1_rows.append({'Variable': '--- ICU ---', **{nm: '' for nm in groups}})
     table1_rows.append({'Variable': 'Any ICU, n (%)', **{nm: summarize_binary(df, 'had_icu') for nm, df in groups.items()}})
 
-    icu_type_cols = ['icu_cardiac_icu', 'icu_neuro_icu', 'icu_surgical_icu', 'icu_medical_icu']
+    icu_type_cols = sorted([c for c in analysis_df.columns if c.endswith('_icu') and c not in ('had_icu',)])
     table1_rows.extend([
         {'Variable': f'{col}, n (%)', **{nm: summarize_binary(df, col) for nm, df in groups.items()}}
         for col in icu_type_cols
@@ -1015,8 +1016,8 @@ def _(
             row[nm] = 'N/A'
     table1_rows.append(row)
 
-    # Time to first organ failure (also only for ASE groups)
-    row = {'Variable': 'Time to first organ failure (hours), median (IQR)'}
+    # Adm to 1st organ failure (also only for ASE groups)
+    row = {'Variable': 'Adm to 1st organ failure (hours), median (IQR)'}
     for nm, df in groups.items():
         if nm in ase_group_names:
             row[nm] = summarize_median_iqr(df, 'time_to_organ_failure_hours')
@@ -1024,8 +1025,8 @@ def _(
             row[nm] = 'N/A'
     table1_rows.append(row)
 
-    # Time to first organ failure mean
-    row = {'Variable': 'Time to first organ failure (hours), mean (SD)'}
+    # Adm to 1st organ failure mean
+    row = {'Variable': 'Adm to 1st organ failure (hours), mean (SD)'}
     for nm, df in groups.items():
         if nm in ase_group_names:
             vals = df['time_to_organ_failure_hours'].dropna()
@@ -1034,8 +1035,8 @@ def _(
             row[nm] = 'N/A'
     table1_rows.append(row)
 
-    # Time to second organ failure (also only for ASE groups)
-    row = {'Variable': 'Time to second organ failure (hours), median (IQR)'}
+    # 1st to 2nd organ failure (also only for ASE groups)
+    row = {'Variable': '1st to 2nd organ failure (hours), median (IQR)'}
     for nm, df in groups.items():
         if nm in ase_group_names:
             row[nm] = summarize_median_iqr(df, 'time_to_second_organ_hours')
@@ -1043,8 +1044,8 @@ def _(
             row[nm] = 'N/A'
     table1_rows.append(row)
 
-    # Time to second organ failure mean
-    row = {'Variable': 'Time to second organ failure (hours), mean (SD)'}
+    # 1st to 2nd organ failure mean
+    row = {'Variable': '1st to 2nd organ failure (hours), mean (SD)'}
     for nm, df in groups.items():
         if nm in ase_group_names:
             vals = df['time_to_second_organ_hours'].dropna()
@@ -1410,58 +1411,38 @@ def _(
     # Merge back to analysis_df to get group info
     lactate_counts_with_groups = pd.merge(
         lactate_counts,
-        analysis_df[['hospitalization_id', 'group_no_presumed_infection', 'group_presumed_infection', 'group_ase_w_lactate', 'group_ase_wo_lactate', 'group_lactate_only_ase']],
+        analysis_df[['hospitalization_id', 'admission_dttm', 'group_no_presumed_infection', 'group_presumed_infection', 'group_ase_w_lactate', 'group_ase_wo_lactate', 'group_lactate_only_ase']],
         on='hospitalization_id',
         how='left'
     )
 
-    # Create summary by group
+    # Derive year_month from admission_dttm
+    lactate_counts_with_groups['year_month'] = pd.to_datetime(
+        lactate_counts_with_groups['admission_dttm']
+    ).dt.to_period('M').astype(str)
+
+    # Group definitions: group_name -> (flag_column, lactate_count_column or None)
+    group_defs = {
+        'No Presumed Infection': ('group_no_presumed_infection', None),
+        'Presumed Infection': ('group_presumed_infection', 'lactates_before_presumed_infection'),
+        'ASE with Lactate': ('group_ase_w_lactate', 'lactates_before_ase_w_lactate'),
+        'ASE without Lactate': ('group_ase_wo_lactate', 'lactates_before_ase_wo_lactate'),
+        'Lactate-only ASE': ('group_lactate_only_ase', 'lactates_before_ase_w_lactate'),
+    }
+
+    # Create summary pivoted by year_month (rows) x groups (columns)
     lactate_summary_rows = []
-
-    # No presumed infection group
-    no_pi_subset = lactate_counts_with_groups[lactate_counts_with_groups['group_no_presumed_infection']]
-    lactate_summary_rows.append({
-        'Group': 'No Presumed Infection',
-        'Criteria': 'N/A (no criteria met)',
-        'N': len(no_pi_subset),
-        'Lactates before criteria, median (IQR)': 'N/A'
-    })
-
-    # Presumed infection group
-    pi_subset = lactate_counts_with_groups[lactate_counts_with_groups['group_presumed_infection']]
-    lactate_summary_rows.append({
-        'Group': 'Presumed Infection',
-        'Criteria': 'Before Presumed Infection',
-        'N': len(pi_subset),
-        'Lactates before criteria, median (IQR)': summarize_median_iqr(pi_subset, 'lactates_before_presumed_infection')
-    })
-
-    # ASE with lactate group
-    ase_w_subset = lactate_counts_with_groups[lactate_counts_with_groups['group_ase_w_lactate']]
-    lactate_summary_rows.append({
-        'Group': 'ASE with Lactate',
-        'Criteria': 'Before ASE with Lactate onset',
-        'N': len(ase_w_subset),
-        'Lactates before criteria, median (IQR)': summarize_median_iqr(ase_w_subset, 'lactates_before_ase_w_lactate')
-    })
-
-    # ASE without lactate group
-    ase_wo_subset = lactate_counts_with_groups[lactate_counts_with_groups['group_ase_wo_lactate']]
-    lactate_summary_rows.append({
-        'Group': 'ASE without Lactate',
-        'Criteria': 'Before ASE without Lactate onset',
-        'N': len(ase_wo_subset),
-        'Lactates before criteria, median (IQR)': summarize_median_iqr(ase_wo_subset, 'lactates_before_ase_wo_lactate')
-    })
-
-    # Lactate-only ASE group
-    lactate_only_subset = lactate_counts_with_groups[lactate_counts_with_groups['group_lactate_only_ase']]
-    lactate_summary_rows.append({
-        'Group': 'Lactate-only ASE',
-        'Criteria': 'Before ASE with Lactate onset',
-        'N': len(lactate_only_subset),
-        'Lactates before criteria, median (IQR)': summarize_median_iqr(lactate_only_subset, 'lactates_before_ase_w_lactate')
-    })
+    for ym in sorted(lactate_counts_with_groups['year_month'].unique()):
+        ym_data = lactate_counts_with_groups[lactate_counts_with_groups['year_month'] == ym]
+        _row = {'year_month': ym}
+        for group_name, (flag_col, lactate_col) in group_defs.items():
+            subset = ym_data[ym_data[flag_col]]
+            _row[f'{group_name}_N'] = len(subset)
+            if lactate_col:
+                _row[f'{group_name}_lactates_median_iqr'] = summarize_median_iqr(subset, lactate_col)
+            else:
+                _row[f'{group_name}_lactates_median_iqr'] = 'N/A'
+        lactate_summary_rows.append(_row)
 
     lactate_summary = pd.DataFrame(lactate_summary_rows)
 
@@ -1566,7 +1547,7 @@ def _(
         # ICU
         rws.append({'Variable': '--- ICU ---', **{n: '' for n in grps}})
         rws.append({'Variable': 'Any ICU, n (%)', **{n: summarize_binary(g, 'had_icu') for n, g in grps.items()}})
-        icu_type_cols = ['icu_cardiac_icu', 'icu_neuro_icu', 'icu_surgical_icu', 'icu_medical_icu']
+        icu_type_cols = sorted([c for c in subset.columns if c.endswith('_icu') and c not in ('had_icu',)])
         rws.extend([
             {'Variable': f'{col}, n (%)', **{n: summarize_binary(g, col) for n, g in grps.items()}}
             for col in icu_type_cols
@@ -1614,14 +1595,14 @@ def _(
             row[n] = summarize_median_iqr(g, 'organ_dysfunction_count') if n in ase_group_names else 'N/A'
         rws.append(row)
 
-        # Time to first organ failure (ASE groups only)
-        row = {'Variable': 'Time to first organ failure (hours), median (IQR)'}
+        # Adm to 1st organ failure (ASE groups only)
+        row = {'Variable': 'Adm to 1st organ failure (hours), median (IQR)'}
         for n, g in grps.items():
             row[n] = summarize_median_iqr(g, 'time_to_organ_failure_hours') if n in ase_group_names else 'N/A'
         rws.append(row)
 
-        # Time to first organ failure mean
-        row = {'Variable': 'Time to first organ failure (hours), mean (SD)'}
+        # Adm to 1st organ failure mean
+        row = {'Variable': 'Adm to 1st organ failure (hours), mean (SD)'}
         for n, g in grps.items():
             if n in ase_group_names:
                 vals = g['time_to_organ_failure_hours'].dropna()
@@ -1630,14 +1611,14 @@ def _(
                 row[n] = 'N/A'
         rws.append(row)
 
-        # Time to second organ failure (ASE groups only)
-        row = {'Variable': 'Time to second organ failure (hours), median (IQR)'}
+        # 1st to 2nd organ failure (ASE groups only)
+        row = {'Variable': '1st to 2nd organ failure (hours), median (IQR)'}
         for n, g in grps.items():
             row[n] = summarize_median_iqr(g, 'time_to_second_organ_hours') if n in ase_group_names else 'N/A'
         rws.append(row)
 
-        # Time to second organ failure mean
-        row = {'Variable': 'Time to second organ failure (hours), mean (SD)'}
+        # 1st to 2nd organ failure mean
+        row = {'Variable': '1st to 2nd organ failure (hours), mean (SD)'}
         for n, g in grps.items():
             if n in ase_group_names:
                 vals = g['time_to_second_organ_hours'].dropna()
