@@ -499,8 +499,12 @@ def _(
     analysis_df['group_no_presumed_infection'] = analysis_df['presumed_infection'] == 0
     analysis_df['group_lactate_only_ase'] = (
         (analysis_df['sepsis'] == 1) &
-        (analysis_df['ase_first_criteria_w_lactate'] == 'lactate') &
-        (analysis_df['sepsis_wo_lactate'] == 0)
+        (analysis_df['lactate_dttm'].notna()) &
+        (analysis_df['vasopressor_dttm'].isna()) &
+        (analysis_df['imv_dttm'].isna()) &
+        (analysis_df['aki_dttm'].isna()) &
+        (analysis_df['hyperbilirubinemia_dttm'].isna()) &
+        (analysis_df['thrombocytopenia_dttm'].isna())
     )
 
     # Merge all derived DataFrames
@@ -567,6 +571,13 @@ def _(
         times.sort(key=lambda x: x[0])
         return times
 
+    def get_first_organ_dysfunction(row, include_lactate=True):
+        """Return the name of the first organ dysfunction by datetime."""
+        times = compute_organ_sequence(row, include_lactate=include_lactate)
+        if times:
+            return times[0][1].replace('_dttm', '')
+        return None
+
     # Compute time from 1st to 2nd organ failure (with lactate)
     def time_to_second_organ(row):
         times = compute_organ_sequence(row, include_lactate=True)
@@ -575,6 +586,13 @@ def _(
         return None
 
     analysis_df['time_to_second_organ_hours'] = analysis_df.apply(time_to_second_organ, axis=1)
+
+    analysis_df['first_organ_dysfunction_w_lactate'] = analysis_df.apply(
+        lambda row: get_first_organ_dysfunction(row, include_lactate=True), axis=1
+    )
+    analysis_df['first_organ_dysfunction_wo_lactate'] = analysis_df.apply(
+        lambda row: get_first_organ_dysfunction(row, include_lactate=False), axis=1
+    )
 
     # Time from lactate (when it was first) to 2nd organ failure
     def lactate_to_second_organ(row):
@@ -779,6 +797,10 @@ def _():
                     'thrombocytopenia', 'lactate']
         first_wo = ['vasopressor', 'imv', 'aki', 'hyperbilirubinemia',
                      'thrombocytopenia']
+        ase_onset_w = ['blood_culture', 'first_qad', 'vasopressor', 'imv', 'aki',
+                       'hyperbilirubinemia', 'thrombocytopenia', 'lactate']
+        ase_onset_wo = ['blood_culture', 'first_qad', 'vasopressor', 'imv', 'aki',
+                        'hyperbilirubinemia', 'thrombocytopenia']
 
         result = {"site_name": site_name, "table_type": table_type, "groups": {}}
 
@@ -848,11 +870,19 @@ def _():
             )
 
             # First Organ – ASE groups only
+            g["categorical"]["first_organ_dysfunction_w_lactate"] = (
+                categ(df, "first_organ_dysfunction_w_lactate", first_w) if is_ase else None
+            )
+            g["categorical"]["first_organ_dysfunction_wo_lactate"] = (
+                categ(df, "first_organ_dysfunction_wo_lactate", first_wo) if is_ase else None
+            )
+
+            # ASE Onset Criteria – ASE groups only
             g["categorical"]["ase_first_criteria_w_lactate"] = (
-                categ(df, "ase_first_criteria_w_lactate", first_w) if is_ase else None
+                categ(df, "ase_first_criteria_w_lactate", ase_onset_w) if is_ase else None
             )
             g["categorical"]["ase_first_criteria_wo_lactate"] = (
-                categ(df, "ase_first_criteria_wo_lactate", first_wo) if is_ase else None
+                categ(df, "ase_first_criteria_wo_lactate", ase_onset_wo) if is_ase else None
             )
 
             # Outcomes
@@ -1127,7 +1157,7 @@ def _(
     row = {'Variable': 'First organ dysfunction (w/ lactate), top'}
     for nm, df in groups.items():
         if nm in ase_group_names:
-            row[nm] = summarize_first_organ_dysfunction(df, 'ase_first_criteria_w_lactate')
+            row[nm] = summarize_first_organ_dysfunction(df, 'first_organ_dysfunction_w_lactate')
         else:
             row[nm] = 'N/A'
     table1_rows.append(row)
@@ -1145,7 +1175,7 @@ def _(
         row = {'Variable': f'  {lbl}, n (%)'}
         for nm, df in groups.items():
             if nm in ase_group_names:
-                row[nm] = summarize_binary(df, df['ase_first_criteria_w_lactate'] == val)
+                row[nm] = summarize_binary(df, df['first_organ_dysfunction_w_lactate'] == val)
             else:
                 row[nm] = 'N/A'
         table1_rows.append(row)
@@ -1154,7 +1184,7 @@ def _(
     row = {'Variable': 'First organ dysfunction (w/o lactate), top'}
     for nm, df in groups.items():
         if nm in ase_group_names:
-            row[nm] = summarize_first_organ_dysfunction(df, 'ase_first_criteria_wo_lactate')
+            row[nm] = summarize_first_organ_dysfunction(df, 'first_organ_dysfunction_wo_lactate')
         else:
             row[nm] = 'N/A'
     table1_rows.append(row)
@@ -1168,6 +1198,61 @@ def _(
         ('thrombocytopenia', 'Thrombocytopenia'),
     ]
     for val, lbl in first_criteria_wo_lactate:
+        row = {'Variable': f'  {lbl}, n (%)'}
+        for nm, df in groups.items():
+            if nm in ase_group_names:
+                row[nm] = summarize_binary(df, df['first_organ_dysfunction_wo_lactate'] == val)
+            else:
+                row[nm] = 'N/A'
+        table1_rows.append(row)
+
+    # ASE onset criteria with lactate (only for ASE groups)
+    row = {'Variable': 'ASE onset criteria (w/ lactate), top'}
+    for nm, df in groups.items():
+        if nm in ase_group_names:
+            row[nm] = summarize_first_organ_dysfunction(df, 'ase_first_criteria_w_lactate')
+        else:
+            row[nm] = 'N/A'
+    table1_rows.append(row)
+
+    ase_criteria_w_lactate = [
+        ('blood_culture', 'Blood Culture'),
+        ('first_qad', 'First QAD'),
+        ('vasopressor', 'Vasopressor'),
+        ('imv', 'IMV'),
+        ('aki', 'AKI'),
+        ('hyperbilirubinemia', 'Hyperbilirubinemia'),
+        ('thrombocytopenia', 'Thrombocytopenia'),
+        ('lactate', 'Lactate'),
+    ]
+    for val, lbl in ase_criteria_w_lactate:
+        row = {'Variable': f'  {lbl}, n (%)'}
+        for nm, df in groups.items():
+            if nm in ase_group_names:
+                row[nm] = summarize_binary(df, df['ase_first_criteria_w_lactate'] == val)
+            else:
+                row[nm] = 'N/A'
+        table1_rows.append(row)
+
+    # ASE onset criteria without lactate (only for ASE groups)
+    row = {'Variable': 'ASE onset criteria (w/o lactate), top'}
+    for nm, df in groups.items():
+        if nm in ase_group_names:
+            row[nm] = summarize_first_organ_dysfunction(df, 'ase_first_criteria_wo_lactate')
+        else:
+            row[nm] = 'N/A'
+    table1_rows.append(row)
+
+    ase_criteria_wo_lactate = [
+        ('blood_culture', 'Blood Culture'),
+        ('first_qad', 'First QAD'),
+        ('vasopressor', 'Vasopressor'),
+        ('imv', 'IMV'),
+        ('aki', 'AKI'),
+        ('hyperbilirubinemia', 'Hyperbilirubinemia'),
+        ('thrombocytopenia', 'Thrombocytopenia'),
+    ]
+    for val, lbl in ase_criteria_wo_lactate:
         row = {'Variable': f'  {lbl}, n (%)'}
         for nm, df in groups.items():
             if nm in ase_group_names:
@@ -1690,7 +1775,7 @@ def _(
 
         row = {'Variable': 'First organ dysfunction (w/ lactate), top'}
         for n, g in grps.items():
-            row[n] = summarize_first_organ_dysfunction(g, 'ase_first_criteria_w_lactate') if n in ase_group_names else 'N/A'
+            row[n] = summarize_first_organ_dysfunction(g, 'first_organ_dysfunction_w_lactate') if n in ase_group_names else 'N/A'
         rws.append(row)
 
         for val, lbl in [('vasopressor', 'Vasopressor'), ('imv', 'IMV'), ('aki', 'AKI'),
@@ -1698,15 +1783,42 @@ def _(
                          ('lactate', 'Lactate')]:
             row = {'Variable': f'  {lbl}, n (%)'}
             for n, g in grps.items():
-                row[n] = summarize_binary(g, g['ase_first_criteria_w_lactate'] == val) if n in ase_group_names else 'N/A'
+                row[n] = summarize_binary(g, g['first_organ_dysfunction_w_lactate'] == val) if n in ase_group_names else 'N/A'
             rws.append(row)
 
         row = {'Variable': 'First organ dysfunction (w/o lactate), top'}
         for n, g in grps.items():
-            row[n] = summarize_first_organ_dysfunction(g, 'ase_first_criteria_wo_lactate') if n in ase_group_names else 'N/A'
+            row[n] = summarize_first_organ_dysfunction(g, 'first_organ_dysfunction_wo_lactate') if n in ase_group_names else 'N/A'
         rws.append(row)
 
         for val, lbl in [('vasopressor', 'Vasopressor'), ('imv', 'IMV'), ('aki', 'AKI'),
+                         ('hyperbilirubinemia', 'Hyperbilirubinemia'), ('thrombocytopenia', 'Thrombocytopenia')]:
+            row = {'Variable': f'  {lbl}, n (%)'}
+            for n, g in grps.items():
+                row[n] = summarize_binary(g, g['first_organ_dysfunction_wo_lactate'] == val) if n in ase_group_names else 'N/A'
+            rws.append(row)
+
+        row = {'Variable': 'ASE onset criteria (w/ lactate), top'}
+        for n, g in grps.items():
+            row[n] = summarize_first_organ_dysfunction(g, 'ase_first_criteria_w_lactate') if n in ase_group_names else 'N/A'
+        rws.append(row)
+
+        for val, lbl in [('blood_culture', 'Blood Culture'), ('first_qad', 'First QAD'),
+                         ('vasopressor', 'Vasopressor'), ('imv', 'IMV'), ('aki', 'AKI'),
+                         ('hyperbilirubinemia', 'Hyperbilirubinemia'), ('thrombocytopenia', 'Thrombocytopenia'),
+                         ('lactate', 'Lactate')]:
+            row = {'Variable': f'  {lbl}, n (%)'}
+            for n, g in grps.items():
+                row[n] = summarize_binary(g, g['ase_first_criteria_w_lactate'] == val) if n in ase_group_names else 'N/A'
+            rws.append(row)
+
+        row = {'Variable': 'ASE onset criteria (w/o lactate), top'}
+        for n, g in grps.items():
+            row[n] = summarize_first_organ_dysfunction(g, 'ase_first_criteria_wo_lactate') if n in ase_group_names else 'N/A'
+        rws.append(row)
+
+        for val, lbl in [('blood_culture', 'Blood Culture'), ('first_qad', 'First QAD'),
+                         ('vasopressor', 'Vasopressor'), ('imv', 'IMV'), ('aki', 'AKI'),
                          ('hyperbilirubinemia', 'Hyperbilirubinemia'), ('thrombocytopenia', 'Thrombocytopenia')]:
             row = {'Variable': f'  {lbl}, n (%)'}
             for n, g in grps.items():
