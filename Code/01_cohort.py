@@ -355,6 +355,70 @@ def _(PHI_DIR, SITE_NAME, ase_results):
 
 
 @app.cell
+def _(ase_results, pd, OUTPUT_DIR, SITE_NAME):
+    # Organ dysfunction breakdown across 3 ASE groups
+    organ_cols = {
+        'vasopressor': 'vasopressor_dttm',
+        'IMV': 'imv_dttm',
+        'AKI': 'aki_dttm',
+        'bilirubin': 'hyperbilirubinemia_dttm',
+        'thrombocytopenia': 'thrombocytopenia_dttm',
+        'lactate': 'lactate_dttm',
+    }
+    organ_cols_no_lactate = {k: v for k, v in organ_cols.items() if k != 'lactate'}
+
+    # Group 1: ASE with lactate criterion AND actually had elevated lactate
+    group1 = ase_results[(ase_results['sepsis'] == 1) & (ase_results['lactate_dttm'].notna())]
+    # Group 2: All ASE (6-criterion definition)
+    group2 = ase_results[ase_results['sepsis'] == 1]
+    # Group 3: ASE without lactate criterion (5-criterion definition)
+    group3 = ase_results[ase_results['sepsis_wo_lactate'] == 1]
+
+    groups = {
+        'ASE_with_lactate_AND_met_lactate': group1,
+        'ASE_with_lactate': group2,
+        'ASE_without_lactate': group3,
+    }
+
+    rows = {}
+    for gname, gdf in groups.items():
+        n_total = len(gdf)
+        # Per-organ counts and percentages
+        for organ, col in organ_cols.items():
+            n = int(gdf[col].notna().sum())
+            pct = round(n / n_total * 100, 1) if n_total > 0 else 0.0
+            rows.setdefault(f'{organ}_n', {})[gname] = n
+            rows.setdefault(f'{organ}_percent', {})[gname] = pct
+
+        # Organ failure totals — group 3 uses 5 criteria (no lactate)
+        if gname == 'ASE_without_lactate':
+            count_cols = list(organ_cols_no_lactate.values())
+            max_organs = 5
+        else:
+            count_cols = list(organ_cols.values())
+            max_organs = 6
+
+        organ_count = gdf[count_cols].notna().sum(axis=1)
+        count_dist = organ_count.value_counts()
+        for i in range(1, 7):
+            key = f'total {i} organ failure{"s" if i > 1 else ""}_n'
+            if gname == 'ASE_without_lactate' and i > max_organs:
+                rows.setdefault(key, {})[gname] = 'NA'
+            else:
+                rows.setdefault(key, {})[gname] = int(count_dist.get(i, 0))
+
+    breakdown_df = pd.DataFrame(rows).T
+    breakdown_df.index.name = 'metric'
+
+    out_path = OUTPUT_DIR / f"{SITE_NAME}_organ_dysfunction_breakdown.csv"
+    breakdown_df.to_csv(out_path)
+    print(f"Organ dysfunction breakdown saved to: {out_path}")
+    print(f"Shape: {breakdown_df.shape}")
+    print(breakdown_df.to_string())
+    return
+
+
+@app.cell
 def _(ase_results):
     # Display ASE results
     ase_results
