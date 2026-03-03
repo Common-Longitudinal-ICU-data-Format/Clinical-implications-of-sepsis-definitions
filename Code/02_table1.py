@@ -79,8 +79,8 @@ def _(mo):
 @app.cell
 def _(PHI_DIR, SITE_NAME, pd):
     # Load cohort and ASE results from notebook 1 (PHI data)
-    cohort_df = pd.read_parquet(PHI_DIR / f"{SITE_NAME}_cohort_df.parquet")
-    ase_df = pd.read_parquet(PHI_DIR / f"{SITE_NAME}_ase_results.parquet")
+    cohort_df = pd.read_parquet(PHI_DIR / "cohort_df.parquet")
+    ase_df = pd.read_parquet(PHI_DIR / "ase_results.parquet")
 
     # Get hosp_ids from base cohort
     hosp_ids = cohort_df['hospitalization_id'].astype(str).unique().tolist()
@@ -1337,22 +1337,22 @@ def _(
     window_bc_organisms,
 ):
     # Save main Table 1
-    table1_path = OUTPUT_DIR / f"{SITE_NAME}_table1.csv"
+    table1_path = OUTPUT_DIR / "table1.csv"
     table1.to_csv(table1_path, index=False)
     print(f"Table 1 saved to: {table1_path}")
 
     # Save index BC organisms (positive index blood cultures only)
-    index_bc_org_path = OUTPUT_DIR / f"{SITE_NAME}_index_bc_top20_organisms.csv"
+    index_bc_org_path = OUTPUT_DIR / "index_bc_top20_organisms.csv"
     index_bc_organisms.to_csv(index_bc_org_path)
     print(f"Index BC organisms saved to: {index_bc_org_path}")
 
     # Save window BC organisms (all positive cultures in ±2 day window)
-    window_bc_org_path = OUTPUT_DIR / f"{SITE_NAME}_window_bc_top20_organisms.csv"
+    window_bc_org_path = OUTPUT_DIR / "window_bc_top20_organisms.csv"
     window_bc_organisms.to_csv(window_bc_org_path)
     print(f"Window BC organisms saved to: {window_bc_org_path}")
 
     # Save organ failure sequence times
-    sequence_path = OUTPUT_DIR / f"{SITE_NAME}_organ_failure_sequence_times.csv"
+    sequence_path = OUTPUT_DIR / "organ_failure_sequence_times.csv"
     sequence_summary.to_csv(sequence_path, index=False)
     print(f"Organ failure sequence times saved to: {sequence_path}")
     return
@@ -1370,7 +1370,7 @@ def _(OUTPUT_DIR, SITE_NAME, analysis_df, compute_table1_json, json):
         'Lactate-only ASE': analysis_df[analysis_df['group_lactate_only_ase']]
     }
     table1_json = compute_table1_json(_groups, SITE_NAME, "overall")
-    table1_json_path = OUTPUT_DIR / f"{SITE_NAME}_table1.json"
+    table1_json_path = OUTPUT_DIR / "table1.json"
     table1_json_path.write_text(json.dumps(table1_json, indent=2))
     print(f"Table 1 JSON saved to: {table1_json_path}")
     return
@@ -1434,7 +1434,7 @@ def _(OUTPUT_DIR, SITE_NAME, analysis_df, pd):
     site_summary = site_df.groupby(group_cols, group_keys=False).apply(compute_site_summary).reset_index()
 
     # Save
-    site_summary_path = OUTPUT_DIR / f"{SITE_NAME}_site_summary.csv"
+    site_summary_path = OUTPUT_DIR / "site_summary.csv"
     site_summary.to_csv(site_summary_path, index=False)
     print(f"Site summary saved to: {site_summary_path}")
     print(f"  Rows: {len(site_summary)} (unique year/hospital combinations)")
@@ -1532,7 +1532,7 @@ def _(
     lactate_summary = pd.DataFrame(lactate_summary_rows)
 
     # Save lactate summary
-    lactate_summary_path = OUTPUT_DIR / f"{SITE_NAME}_lactate_counts_summary.csv"
+    lactate_summary_path = OUTPUT_DIR / "lactate_counts_summary.csv"
     lactate_summary.to_csv(lactate_summary_path, index=False)
     print(f"Lactate summary saved to: {lactate_summary_path}")
     print(lactate_summary)
@@ -1892,11 +1892,11 @@ def _(
 
     saved_strat_paths = []
     if strat_results.get('community') is not None:
-        comm_path = OUTPUT_DIR / f"{SITE_NAME}_table1_community_onset.csv"
+        comm_path = OUTPUT_DIR / "table1_community_onset.csv"
         strat_results['community'].to_csv(comm_path, index=False)
         saved_strat_paths.append(str(comm_path))
         comm_json = compute_table1_json(strat_groups['community'], SITE_NAME, "community_onset")
-        comm_json_path = OUTPUT_DIR / f"{SITE_NAME}_table1_community_onset.json"
+        comm_json_path = OUTPUT_DIR / "table1_community_onset.json"
         comm_json_path.write_text(json.dumps(comm_json, indent=2))
         print(f"Community-onset Table 1 saved: {comm_path}")
         print(f"Community-onset Table 1 JSON saved: {comm_json_path}")
@@ -1905,11 +1905,11 @@ def _(
         print("No community-onset cases found")
 
     if strat_results.get('hospital') is not None:
-        hosp_path = OUTPUT_DIR / f"{SITE_NAME}_table1_hospital_onset.csv"
+        hosp_path = OUTPUT_DIR / "table1_hospital_onset.csv"
         strat_results['hospital'].to_csv(hosp_path, index=False)
         saved_strat_paths.append(str(hosp_path))
         hosp_json = compute_table1_json(strat_groups['hospital'], SITE_NAME, "hospital_onset")
-        hosp_json_path = OUTPUT_DIR / f"{SITE_NAME}_table1_hospital_onset.json"
+        hosp_json_path = OUTPUT_DIR / "table1_hospital_onset.json"
         hosp_json_path.write_text(json.dumps(hosp_json, indent=2))
         print(f"Hospital-onset Table 1 saved: {hosp_path}")
         print(f"Hospital-onset Table 1 JSON saved: {hosp_json_path}")

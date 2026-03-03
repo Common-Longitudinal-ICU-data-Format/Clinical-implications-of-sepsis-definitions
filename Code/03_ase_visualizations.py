@@ -67,7 +67,7 @@ def _(Path, json):
 @app.cell
 def _(PHI_DIR, SITE_NAME, pd):
     # Load ASE results from cohort notebook (PHI data)
-    ase_results_path = PHI_DIR / f"{SITE_NAME}_ase_results.parquet"
+    ase_results_path = PHI_DIR / "ase_results.parquet"
     ase_df = pd.read_parquet(ase_results_path)
 
     print(f"Loaded ASE results: {len(ase_df):,} records")
@@ -79,7 +79,7 @@ def _(PHI_DIR, SITE_NAME, pd):
 @app.cell
 def _(PHI_DIR, SITE_NAME, pd):
     cohort_df = pd.read_parquet(
-        PHI_DIR / f"{SITE_NAME}_cohort_df.parquet",
+        PHI_DIR / "cohort_df.parquet",
         columns=["hospitalization_id", "hospital_id", "hospital_type", "admission_dttm"]
     ).drop_duplicates(subset=["hospitalization_id"])
     print(f"Loaded cohort: {len(cohort_df):,} hospitalizations")
@@ -1075,20 +1075,20 @@ def _(
     DATA_DIR.mkdir(parents=True, exist_ok=True)
 
     # Save Sankey plots as interactive HTML
-    sankey_w_lactate_path = PLOTS_DIR / f"{SITE_NAME}_sankey_ase_w_lactate.html"
+    sankey_w_lactate_path = PLOTS_DIR / "sankey_ase_w_lactate.html"
     sankey_w_lactate.write_html(str(sankey_w_lactate_path))
     print(f"Saved: {sankey_w_lactate_path}")
 
-    sankey_wo_lactate_path = PLOTS_DIR / f"{SITE_NAME}_sankey_ase_wo_lactate.html"
+    sankey_wo_lactate_path = PLOTS_DIR / "sankey_ase_wo_lactate.html"
     sankey_wo_lactate.write_html(str(sankey_wo_lactate_path))
     print(f"Saved: {sankey_wo_lactate_path}")
 
     # Save QAD distribution plot
-    qad_html_path = PLOTS_DIR / f"{SITE_NAME}_qad_distribution.html"
+    qad_html_path = PLOTS_DIR / "qad_distribution.html"
     qad_distribution.write_html(str(qad_html_path))
     print(f"Saved: {qad_html_path}")
 
-    qad_png_path = PLOTS_DIR / f"{SITE_NAME}_qad_distribution.png"
+    qad_png_path = PLOTS_DIR / "qad_distribution.png"
     fig, ax = plt.subplots(figsize=(9, 5))
     x_labels = qad_data_df["qad_days"].astype(str)
     x = range(len(x_labels))
@@ -1108,11 +1108,11 @@ def _(
     print(f"Saved: {qad_png_path}")
 
     # Save yearly cases plot
-    yearly_cases_html = PLOTS_DIR / f"{SITE_NAME}_yearly_cases.html"
+    yearly_cases_html = PLOTS_DIR / "yearly_cases.html"
     yearly_cases_fig.write_html(str(yearly_cases_html))
     print(f"Saved: {yearly_cases_html}")
 
-    yearly_cases_png = PLOTS_DIR / f"{SITE_NAME}_yearly_cases.png"
+    yearly_cases_png = PLOTS_DIR / "yearly_cases.png"
     yc = yearly_cases[yearly_cases["year_month"] != "Total"]
     fig, ax = plt.subplots(figsize=(11, 5))
     ax.plot(yc["year_month"], yc["sepsis"], marker="o", markersize=4,
@@ -1131,11 +1131,11 @@ def _(
     print(f"Saved: {yearly_cases_png}")
 
     # Save monthly organs WITH lactate
-    organ_w_html = PLOTS_DIR / f"{SITE_NAME}_monthly_organs_w_lactate.html"
+    organ_w_html = PLOTS_DIR / "monthly_organs_w_lactate.html"
     organ_monthly_w_fig.write_html(str(organ_w_html))
     print(f"Saved: {organ_w_html}")
 
-    organ_w_png = PLOTS_DIR / f"{SITE_NAME}_monthly_organs_w_lactate.png"
+    organ_w_png = PLOTS_DIR / "monthly_organs_w_lactate.png"
     _organ_colors = {
         "Vasopressor": (255/255, 99/255, 71/255),
         "IMV": (30/255, 144/255, 255/255),
@@ -1161,11 +1161,11 @@ def _(
     print(f"Saved: {organ_w_png}")
 
     # Save monthly organs WITHOUT lactate
-    organ_wo_html = PLOTS_DIR / f"{SITE_NAME}_monthly_organs_wo_lactate.html"
+    organ_wo_html = PLOTS_DIR / "monthly_organs_wo_lactate.html"
     organ_monthly_wo_fig.write_html(str(organ_wo_html))
     print(f"Saved: {organ_wo_html}")
 
-    organ_wo_png = PLOTS_DIR / f"{SITE_NAME}_monthly_organs_wo_lactate.png"
+    organ_wo_png = PLOTS_DIR / "monthly_organs_wo_lactate.png"
     owo = organ_monthly_wo_pivot[organ_monthly_wo_pivot["year_month"] != "Total"]
     fig, ax = plt.subplots(figsize=(11, 5))
     for _col in [c for c in owo.columns if c != "year_month" and "_pct" not in c]:
@@ -1183,11 +1183,11 @@ def _(
     print(f"Saved: {organ_wo_png}")
 
     # Save monthly onset WITH lactate
-    yearly_onset_w_html = PLOTS_DIR / f"{SITE_NAME}_monthly_onset_w_lactate.html"
+    yearly_onset_w_html = PLOTS_DIR / "monthly_onset_w_lactate.html"
     yearly_onset_w_fig.write_html(str(yearly_onset_w_html))
     print(f"Saved: {yearly_onset_w_html}")
 
-    yearly_onset_w_png = PLOTS_DIR / f"{SITE_NAME}_monthly_onset_w_lactate.png"
+    yearly_onset_w_png = PLOTS_DIR / "monthly_onset_w_lactate.png"
     yw = yearly_onset_w_data[yearly_onset_w_data["year_month"] != "Total"]
     fig, ax = plt.subplots(figsize=(11, 5))
     if "community" in yw.columns:
@@ -1208,11 +1208,11 @@ def _(
     print(f"Saved: {yearly_onset_w_png}")
 
     # Save monthly onset WITHOUT lactate
-    yearly_onset_wo_html = PLOTS_DIR / f"{SITE_NAME}_monthly_onset_wo_lactate.html"
+    yearly_onset_wo_html = PLOTS_DIR / "monthly_onset_wo_lactate.html"
     yearly_onset_wo_fig.write_html(str(yearly_onset_wo_html))
     print(f"Saved: {yearly_onset_wo_html}")
 
-    yearly_onset_wo_png = PLOTS_DIR / f"{SITE_NAME}_monthly_onset_wo_lactate.png"
+    yearly_onset_wo_png = PLOTS_DIR / "monthly_onset_wo_lactate.png"
     ywo = yearly_onset_wo_data[yearly_onset_wo_data["year_month"] != "Total"]
     fig, ax = plt.subplots(figsize=(11, 5))
     if "community" in ywo.columns:
@@ -1235,48 +1235,48 @@ def _(
     print("\n--- Plots saved ---")
 
     # Save CSV data files (aggregated transition counts, no PHI)
-    sankey_w_lactate_csv = DATA_DIR / f"{SITE_NAME}_sankey_ase_w_lactate_data.csv"
+    sankey_w_lactate_csv = DATA_DIR / "sankey_ase_w_lactate_data.csv"
     sankey_w_lactate_data.to_csv(str(sankey_w_lactate_csv), index=False)
     print(f"Saved: {sankey_w_lactate_csv}")
 
-    sankey_wo_lactate_csv = DATA_DIR / f"{SITE_NAME}_sankey_ase_wo_lactate_data.csv"
+    sankey_wo_lactate_csv = DATA_DIR / "sankey_ase_wo_lactate_data.csv"
     sankey_wo_lactate_data.to_csv(str(sankey_wo_lactate_csv), index=False)
     print(f"Saved: {sankey_wo_lactate_csv}")
 
-    qad_csv_path = DATA_DIR / f"{SITE_NAME}_qad_distribution_data.csv"
+    qad_csv_path = DATA_DIR / "qad_distribution_data.csv"
     qad_data_df.to_csv(str(qad_csv_path), index=False)
     print(f"Saved: {qad_csv_path}")
 
-    yearly_cases_csv = DATA_DIR / f"{SITE_NAME}_yearly_cases_data.csv"
+    yearly_cases_csv = DATA_DIR / "yearly_cases_data.csv"
     yearly_cases.to_csv(str(yearly_cases_csv), index=False)
     print(f"Saved: {yearly_cases_csv}")
 
-    organ_w_csv = DATA_DIR / f"{SITE_NAME}_monthly_organs_w_lactate_data.csv"
+    organ_w_csv = DATA_DIR / "monthly_organs_w_lactate_data.csv"
     organ_monthly_w_pivot.to_csv(str(organ_w_csv), index=False)
     print(f"Saved: {organ_w_csv}")
 
-    organ_wo_csv = DATA_DIR / f"{SITE_NAME}_monthly_organs_wo_lactate_data.csv"
+    organ_wo_csv = DATA_DIR / "monthly_organs_wo_lactate_data.csv"
     organ_monthly_wo_pivot.to_csv(str(organ_wo_csv), index=False)
     print(f"Saved: {organ_wo_csv}")
 
-    yearly_onset_w_csv = DATA_DIR / f"{SITE_NAME}_monthly_onset_w_lactate_data.csv"
+    yearly_onset_w_csv = DATA_DIR / "monthly_onset_w_lactate_data.csv"
     yearly_onset_w_data.to_csv(str(yearly_onset_w_csv), index=False)
     print(f"Saved: {yearly_onset_w_csv}")
 
-    yearly_onset_wo_csv = DATA_DIR / f"{SITE_NAME}_monthly_onset_wo_lactate_data.csv"
+    yearly_onset_wo_csv = DATA_DIR / "monthly_onset_wo_lactate_data.csv"
     yearly_onset_wo_data.to_csv(str(yearly_onset_wo_csv), index=False)
     print(f"Saved: {yearly_onset_wo_csv}")
 
-    lactate_csv = DATA_DIR / f"{SITE_NAME}_lactate_counts_by_hospital.csv"
+    lactate_csv = DATA_DIR / "lactate_counts_by_hospital.csv"
     lactate_counts.to_csv(str(lactate_csv), index=False)
     print(f"Saved: {lactate_csv}")
 
     # Save QAD lactate trend — WITH lactate
-    qad_lac_w_html = PLOTS_DIR / f"{SITE_NAME}_qad_lactate_trend_w_lactate.html"
+    qad_lac_w_html = PLOTS_DIR / "qad_lactate_trend_w_lactate.html"
     qad_lactate_w_fig.write_html(str(qad_lac_w_html))
     print(f"Saved: {qad_lac_w_html}")
 
-    qad_lac_w_png = PLOTS_DIR / f"{SITE_NAME}_qad_lactate_trend_w_lactate.png"
+    qad_lac_w_png = PLOTS_DIR / "qad_lactate_trend_w_lactate.png"
     _qlw = qad_lactate_w_data.copy()
     fig, ax = plt.subplots(figsize=(11, 5))
     for hosp in sorted(_qlw['hospital_id'].unique()):
@@ -1293,16 +1293,16 @@ def _(
     plt.close(fig)
     print(f"Saved: {qad_lac_w_png}")
 
-    qad_lac_w_csv = DATA_DIR / f"{SITE_NAME}_qad_lactate_trend_w_lactate_data.csv"
+    qad_lac_w_csv = DATA_DIR / "qad_lactate_trend_w_lactate_data.csv"
     qad_lactate_w_data.to_csv(str(qad_lac_w_csv), index=False)
     print(f"Saved: {qad_lac_w_csv}")
 
     # Save QAD lactate trend — WITHOUT lactate
-    qad_lac_wo_html = PLOTS_DIR / f"{SITE_NAME}_qad_lactate_trend_wo_lactate.html"
+    qad_lac_wo_html = PLOTS_DIR / "qad_lactate_trend_wo_lactate.html"
     qad_lactate_wo_fig.write_html(str(qad_lac_wo_html))
     print(f"Saved: {qad_lac_wo_html}")
 
-    qad_lac_wo_png = PLOTS_DIR / f"{SITE_NAME}_qad_lactate_trend_wo_lactate.png"
+    qad_lac_wo_png = PLOTS_DIR / "qad_lactate_trend_wo_lactate.png"
     _qlwo = qad_lactate_wo_data.copy()
     fig, ax = plt.subplots(figsize=(11, 5))
     for hosp in sorted(_qlwo['hospital_id'].unique()):
@@ -1319,23 +1319,23 @@ def _(
     plt.close(fig)
     print(f"Saved: {qad_lac_wo_png}")
 
-    qad_lac_wo_csv = DATA_DIR / f"{SITE_NAME}_qad_lactate_trend_wo_lactate_data.csv"
+    qad_lac_wo_csv = DATA_DIR / "qad_lactate_trend_wo_lactate_data.csv"
     qad_lactate_wo_data.to_csv(str(qad_lac_wo_csv), index=False)
     print(f"Saved: {qad_lac_wo_csv}")
 
-    yearly_ed_hosp_csv = DATA_DIR / f"{SITE_NAME}_yearly_ed_hospitalizations.csv"
+    yearly_ed_hosp_csv = DATA_DIR / "yearly_ed_hospitalizations.csv"
     yearly_hosp_counts.to_csv(str(yearly_ed_hosp_csv), index=False)
     print(f"Saved: {yearly_ed_hosp_csv}")
 
-    yearly_ed_summary_csv = DATA_DIR / f"{SITE_NAME}_yearly_ed_summary_stats.csv"
+    yearly_ed_summary_csv = DATA_DIR / "yearly_ed_summary_stats.csv"
     yearly_ed_summary.to_csv(str(yearly_ed_summary_csv), index=False)
     print(f"Saved: {yearly_ed_summary_csv}")
 
-    top20_meds_w_csv = DATA_DIR / f"{SITE_NAME}_top20_qad_meds_w_lactate.csv"
+    top20_meds_w_csv = DATA_DIR / "top20_qad_meds_w_lactate.csv"
     top20_meds_w_lactate.to_csv(str(top20_meds_w_csv), index=False)
     print(f"Saved: {top20_meds_w_csv}")
 
-    top20_meds_wo_csv = DATA_DIR / f"{SITE_NAME}_top20_qad_meds_wo_lactate.csv"
+    top20_meds_wo_csv = DATA_DIR / "top20_qad_meds_wo_lactate.csv"
     top20_meds_wo_lactate.to_csv(str(top20_meds_wo_csv), index=False)
     print(f"Saved: {top20_meds_wo_csv}")
 

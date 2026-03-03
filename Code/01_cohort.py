@@ -255,7 +255,7 @@ def _(mo):
 @app.cell
 def _(PHI_DIR, SITE_NAME, final_cohort):
     # Save cohort (PHI - patient-level data)
-    cohort_output_path = PHI_DIR / f"{SITE_NAME}_cohort_df.parquet"
+    cohort_output_path = PHI_DIR / "cohort_df.parquet"
     final_cohort.to_parquet(cohort_output_path, index=False)
 
     print(f"Cohort saved to: {cohort_output_path}")
@@ -346,7 +346,7 @@ def _(mo):
 @app.cell
 def _(PHI_DIR, SITE_NAME, ase_results):
     # Save ASE results (PHI - patient-level data)
-    ase_output_path = PHI_DIR / f"{SITE_NAME}_ase_results.parquet"
+    ase_output_path = PHI_DIR / "ase_results.parquet"
     ase_results.to_parquet(ase_output_path, index=False)
 
     print(f"ASE results saved to: {ase_output_path}")
@@ -410,7 +410,7 @@ def _(ase_results, pd, OUTPUT_DIR, SITE_NAME):
     breakdown_df = pd.DataFrame(rows).T
     breakdown_df.index.name = 'metric'
 
-    out_path = OUTPUT_DIR / f"{SITE_NAME}_organ_dysfunction_breakdown.csv"
+    out_path = OUTPUT_DIR / "organ_dysfunction_breakdown.csv"
     breakdown_df.to_csv(out_path)
     print(f"Organ dysfunction breakdown saved to: {out_path}")
     print(f"Shape: {breakdown_df.shape}")
