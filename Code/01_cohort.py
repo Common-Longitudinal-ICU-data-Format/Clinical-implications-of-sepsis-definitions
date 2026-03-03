@@ -31,9 +31,24 @@ def _(mo):
 def _():
     import json
     import pandas as pd
+    import polars as pl
     from pathlib import Path
-    from clifpy.tables import Patient, Hospitalization, Adt
-    return Adt, Hospitalization, Path, Patient, json, pd
+    from clifpy.tables import Patient, Hospitalization, Adt, Labs, HospitalDiagnosis
+    from clifpy.utils.comorbidity import calculate_cci
+    from clifpy.utils.sofa_polars import compute_sofa_polars
+    return (
+        Adt,
+        HospitalDiagnosis,
+        Hospitalization,
+        Labs,
+        Path,
+        Patient,
+        calculate_cci,
+        compute_sofa_polars,
+        json,
+        pd,
+        pl,
+    )
 
 
 @app.cell
@@ -58,7 +73,7 @@ def _(Path, json):
     print(f"Data directory: {DATA_DIR}")
     print(f"Filetype: {FILETYPE}")
     print(f"Timezone: {TIMEZONE}")
-    return DATA_DIR, FILETYPE, OUTPUT_DIR, PHI_DIR, SITE_NAME, TIMEZONE
+    return DATA_DIR, FILETYPE, OUTPUT_DIR, PHI_DIR, TIMEZONE
 
 
 @app.cell
@@ -253,7 +268,7 @@ def _(mo):
 
 
 @app.cell
-def _(PHI_DIR, SITE_NAME, final_cohort):
+def _(PHI_DIR, final_cohort):
     # Save cohort (PHI - patient-level data)
     cohort_output_path = PHI_DIR / "cohort_df.parquet"
     final_cohort.to_parquet(cohort_output_path, index=False)
@@ -285,7 +300,7 @@ def _():
 
 
 @app.cell
-def _(compute_ase, final_cohort, pd):
+def _(compute_ase, final_cohort):
     # Get hospitalization IDs from cohort
     hosp_ids = final_cohort["hospitalization_id"].astype(str).unique().tolist()
     print(f"Running ASE calculation on {len(hosp_ids):,} hospitalizations...")
@@ -304,19 +319,29 @@ def _(compute_ase, final_cohort, pd):
     )
 
     # Keep first ASE episode OR first blood culture (for non-ASE patients)
-    # For ASE patients: episode_id == 1 (first ASE after RIT)
-    # For non-ASE patients: first blood culture by date (episode_id is NA)
-    ase_first = ase_results_all[ase_results_all["episode_id"] == 1].copy()
-    non_ase_first = (
-        ase_results_all[ase_results_all["episode_id"].isna()]
-        .sort_values("blood_culture_dttm")
-        .drop_duplicates(subset=["hospitalization_id"], keep="first")
+    # Sort: episode_id==1 rows first (notna sorts before NA), then earliest BC
+    ase_sorted = ase_results_all.sort_values(
+        ["hospitalization_id", "episode_id", "blood_culture_dttm"],
+        na_position="last",
     )
-    ase_results = pd.concat([ase_first, non_ase_first], ignore_index=True)
 
+    # One row per hospitalization: prefer episode_id==1, else first BC
+    ase_results = ase_sorted.drop_duplicates(
+        subset=["hospitalization_id"], keep="first"
+    ).copy()
+
+    # QC: flag duplicates
+    n_dupes = ase_results["hospitalization_id"].duplicated().sum()
+    if n_dupes > 0:
+        print(f"WARNING: {n_dupes} duplicate hospitalization_ids in ase_results!")
+    else:
+        print("QC passed: no duplicate hospitalization_ids")
+
+    n_ase = (ase_results["episode_id"] == 1).sum()
+    n_non_ase = ase_results["episode_id"].isna().sum()
     print(f"Filtered to first episode/BC: {len(ase_results):,} hospitalizations")
-    print(f"  - ASE cases: {ase_first['hospitalization_id'].nunique():,}")
-    print(f"  - Non-ASE with blood culture: {non_ase_first['hospitalization_id'].nunique():,}")
+    print(f"  - ASE cases (episode_id==1): {n_ase:,}")
+    print(f"  - Non-ASE with blood culture: {n_non_ase:,}")
     return (ase_results,)
 
 
@@ -344,7 +369,7 @@ def _(mo):
 
 
 @app.cell
-def _(PHI_DIR, SITE_NAME, ase_results):
+def _(PHI_DIR, ase_results):
     # Save ASE results (PHI - patient-level data)
     ase_output_path = PHI_DIR / "ase_results.parquet"
     ase_results.to_parquet(ase_output_path, index=False)
@@ -355,7 +380,7 @@ def _(PHI_DIR, SITE_NAME, ase_results):
 
 
 @app.cell
-def _(ase_results, pd, OUTPUT_DIR, SITE_NAME):
+def _(OUTPUT_DIR, ase_results, pd):
     # Organ dysfunction breakdown across 3 ASE groups
     organ_cols = {
         'vasopressor': 'vasopressor_dttm',
@@ -419,9 +444,361 @@ def _(ase_results, pd, OUTPUT_DIR, SITE_NAME):
 
 
 @app.cell
-def _(ase_results):
-    # Display ASE results
-    ase_results
+def _(mo):
+    mo.md(r"""
+    ## Step 8: Lactate Orders per 1,000 Patient-Days by Hospital
+    """)
+    return
+
+
+@app.cell
+def _(DATA_DIR, FILETYPE, Labs, OUTPUT_DIR, TIMEZONE, adt, hospitalization):
+    # --- 1. All hospitalizations (unfiltered) with LOS ---
+    all_hosp = hospitalization.df[["hospitalization_id", "admission_dttm", "discharge_dttm"]].copy()
+    all_hosp = all_hosp.dropna(subset=["admission_dttm", "discharge_dttm"])
+    all_hosp = all_hosp[
+        (all_hosp["admission_dttm"].dt.year >= 2018) &
+        (all_hosp["admission_dttm"].dt.year <= 2024)
+    ]
+    all_hosp["los_days"] = (
+        (all_hosp["discharge_dttm"] - all_hosp["admission_dttm"])
+        .dt.total_seconds() / 86400
+    )
+    all_hosp["los_days"] = all_hosp["los_days"].clip(lower=1)
+    all_hosp["admission_year"] = all_hosp["admission_dttm"].dt.year
+
+    # --- 2. Map hospital_id / hospital_type from ADT (first record per hosp) ---
+    adt_hosp = (
+        adt.df[["hospitalization_id", "hospital_id", "hospital_type"]]
+        .drop_duplicates(subset=["hospitalization_id"], keep="first")
+    )
+    all_hosp = all_hosp.merge(adt_hosp, on="hospitalization_id", how="inner")
+
+    # --- 3. Load ALL lactate lab orders ---
+    lactate_labs = Labs.from_file(
+        data_directory=DATA_DIR,
+        filetype=FILETYPE,
+        timezone=TIMEZONE,
+        filters={"lab_category": ["lactate"]},
+    )
+    lactate_counts = (
+        lactate_labs.df
+        .groupby("hospitalization_id")
+        .size()
+        .reset_index(name="lactate_orders")
+    )
+
+    # --- 4. Join lactate counts onto hospitalizations ---
+    all_hosp = all_hosp.merge(lactate_counts, on="hospitalization_id", how="left")
+    all_hosp["lactate_orders"] = all_hosp["lactate_orders"].fillna(0).astype(int)
+
+    # --- 5. Aggregate by hospital_id, hospital_type, admission_year ---
+    lactate_rate = (
+        all_hosp
+        .groupby(["hospital_id", "hospital_type", "admission_year"])
+        .agg(
+            n_hospitalizations=("hospitalization_id", "count"),
+            total_patient_days=("los_days", "sum"),
+            total_lactate_orders=("lactate_orders", "sum"),
+        )
+        .reset_index()
+    )
+    lactate_rate["lactate_order_per_1000_patient_days"] = (
+        lactate_rate["total_lactate_orders"] / lactate_rate["total_patient_days"]
+    ) * 1000
+
+    # --- 6. Save ---
+    lactate_rate_path = OUTPUT_DIR / "lactate_orders_per_1000_patient_days.parquet"
+    lactate_rate.to_parquet(lactate_rate_path, index=False)
+
+    print(f"Lactate orders per 1,000 patient-days saved to: {lactate_rate_path}")
+    print(f"Shape: {lactate_rate.shape}")
+    print(lactate_rate.head(10))
+    return (lactate_rate,)
+
+
+@app.cell
+def _(mo):
+    mo.md(r"""
+    ## Step 9: Analysis Dataset (2 Rows per Hospitalization)
+    """)
+    return
+
+
+@app.cell
+def _(DATA_DIR, FILETYPE, HospitalDiagnosis, TIMEZONE, calculate_cci):
+    hospital_diagnosis = HospitalDiagnosis.from_file(
+        data_directory=DATA_DIR,
+        filetype=FILETYPE,
+        timezone=TIMEZONE,
+    )
+    cci_df = calculate_cci(hospital_diagnosis)
+    print(f"CCI computed for {len(cci_df):,} hospitalizations")
+    print(f"CCI score distribution:\n{cci_df['cci_score'].describe()}")
+    return (cci_df,)
+
+
+@app.cell
+def _(
+    DATA_DIR,
+    FILETYPE,
+    TIMEZONE,
+    ase_results,
+    compute_sofa_polars,
+    final_cohort,
+    pd,
+    pl,
+):
+    # Build SOFA cohort: only ASE-positive rows, with per-definition time windows
+    # Each row gets a unique encounter_block so SOFA is computed over
+    # [admission → ASE onset] separately for each definition
+
+    # admission_dttm lives in final_cohort, not ase_results
+    adm_dttm = final_cohort[["hospitalization_id", "admission_dttm"]].drop_duplicates(
+        subset=["hospitalization_id"]
+    )
+
+    # With-lactate definition (sepsis==1)
+    wl = ase_results.loc[
+        ase_results["sepsis"] == 1,
+        ["hospitalization_id", "ase_onset_w_lactate_dttm"],
+    ].copy()
+    wl = wl.merge(adm_dttm, on="hospitalization_id", how="left")
+    wl["encounter_block"] = wl["hospitalization_id"].astype(str) + "_wl"
+    wl = wl.rename(columns={
+        "admission_dttm": "start_dttm",
+        "ase_onset_w_lactate_dttm": "end_dttm",
+    })
+
+    # Without-lactate definition (sepsis_wo_lactate==1)
+    wol = ase_results.loc[
+        ase_results["sepsis_wo_lactate"] == 1,
+        ["hospitalization_id", "ase_onset_wo_lactate_dttm"],
+    ].copy()
+    wol = wol.merge(adm_dttm, on="hospitalization_id", how="left")
+    wol["encounter_block"] = wol["hospitalization_id"].astype(str) + "_wol"
+    wol = wol.rename(columns={
+        "admission_dttm": "start_dttm",
+        "ase_onset_wo_lactate_dttm": "end_dttm",
+    })
+
+    # Full-hospitalization SOFA (for non-ASE rows: admission → discharge)
+    full_hosp = final_cohort[["hospitalization_id", "admission_dttm", "discharge_dttm"]].drop_duplicates(
+        subset=["hospitalization_id"]
+    )
+    full_hosp["encounter_block"] = full_hosp["hospitalization_id"].astype(str) + "_full"
+    full_hosp = full_hosp.rename(columns={"admission_dttm": "start_dttm", "discharge_dttm": "end_dttm"})
+
+    # Combine and convert to polars for compute_sofa_polars
+    sofa_cohort_pl = pl.from_pandas(
+        pd.concat([wl, wol, full_hosp], ignore_index=True)[
+            ["hospitalization_id", "encounter_block", "start_dttm", "end_dttm"]
+        ]
+    )
+    print(f"SOFA cohort: {len(sofa_cohort_pl):,} encounter blocks")
+    print(f"  With-lactate blocks: {len(wl):,}")
+    print(f"  Without-lactate blocks: {len(wol):,}")
+    print(f"  Full-hospitalization blocks: {len(full_hosp):,}")
+
+    # Compute SOFA scores within each time window
+    sofa_result_pl = compute_sofa_polars(
+        DATA_DIR,
+        sofa_cohort_pl,
+        filetype=FILETYPE,
+        id_name="encounter_block",
+        timezone=TIMEZONE,
+    )
+
+    # Split results by suffix → per-definition SOFA DataFrames
+    sofa_wl_df = (
+        sofa_result_pl
+        .filter(pl.col("encounter_block").str.ends_with("_wl"))
+        .with_columns(
+            pl.col("encounter_block").str.replace("_wl$", "").alias("hospitalization_id")
+        )
+        .select(["hospitalization_id", "sofa_total"])
+    )
+    sofa_wol_df = (
+        sofa_result_pl
+        .filter(pl.col("encounter_block").str.ends_with("_wol"))
+        .with_columns(
+            pl.col("encounter_block").str.replace("_wol$", "").alias("hospitalization_id")
+        )
+        .select(["hospitalization_id", "sofa_total"])
+    )
+    sofa_full_df = (
+        sofa_result_pl
+        .filter(pl.col("encounter_block").str.ends_with("_full"))
+        .with_columns(
+            pl.col("encounter_block").str.replace("_full$", "").alias("hospitalization_id")
+        )
+        .select(["hospitalization_id", "sofa_total"])
+    )
+
+    print(f"SOFA results: {len(sofa_wl_df):,} with-lactate, {len(sofa_wol_df):,} without-lactate, {len(sofa_full_df):,} full-hosp")
+    return sofa_wl_df, sofa_wol_df, sofa_full_df
+
+
+@app.cell
+def _(
+    OUTPUT_DIR,
+    ase_results,
+    cci_df,
+    final_cohort,
+    lactate_rate,
+    pd,
+    sofa_full_df,
+    sofa_wl_df,
+    sofa_wol_df,
+):
+    # --- 1. Stack into 2 rows per hospitalization ---
+    melt_src = ase_results[["hospitalization_id", "sepsis", "sepsis_wo_lactate"]].copy()
+    melt_src = melt_src.rename(columns={"sepsis": 1, "sepsis_wo_lactate": 0})
+    analysis_df = melt_src.melt(
+        id_vars=["hospitalization_id"],
+        value_vars=[1, 0],
+        var_name="defined_w_lactic",
+        value_name="ASE",
+    )
+
+    # Sanity-check: count hospitalizations by (ASE_wl, ASE_wol) pattern
+    _pattern = analysis_df.pivot_table(
+        index="hospitalization_id", columns="defined_w_lactic", values="ASE", aggfunc="first"
+    )
+    _pattern_counts = _pattern.groupby([1, 0]).size().reset_index(name="n_hosp")
+    print("ASE pattern counts (wl, wol):\n", _pattern_counts.to_string(index=False))
+    assert (_pattern_counts.query("`1` == 0 and `0` == 1")["n_hosp"].sum() == 0), \
+        "Impossible pattern found: ASE=0 with lactate but ASE=1 without lactate"
+
+    # --- 2. Join demographics from final_cohort ---
+    demo = final_cohort[
+        ["hospitalization_id", "age_at_admission", "sex_category", "hospital_id", "hospital_type", "admission_dttm"]
+    ].drop_duplicates(subset=["hospitalization_id"])
+    analysis_df = analysis_df.merge(demo, on="hospitalization_id", how="left")
+    analysis_df = analysis_df.rename(columns={"age_at_admission": "age", "sex_category": "sex"})
+
+    # --- 3. onset_community1_hospital0 (hospitalization-level, same for both rows) ---
+    # Build lookup from ase_results + admission_dttm (already in analysis_df via demo)
+    onset_src = ase_results[["hospitalization_id"]].copy()
+    onset_src["_type"] = ase_results["type"].values
+    onset_src["_onset_wol_dttm"] = (
+        ase_results["ase_onset_wo_lactate_dttm"].values
+        if "ase_onset_wo_lactate_dttm" in ase_results.columns
+        else pd.NaT
+    )
+    # admission_dttm comes from final_cohort (not in ase_results)
+    onset_src = onset_src.merge(
+        demo[["hospitalization_id", "admission_dttm"]],
+        on="hospitalization_id",
+        how="left",
+    )
+    onset_src = onset_src.drop_duplicates(subset=["hospitalization_id"])
+
+    def _onset_type(row):
+        t = row["_type"]
+        if pd.notna(t):
+            return 1 if t == "community" else 0
+        # Fallback: compute from days since admission
+        onset_dt = row["_onset_wol_dttm"]
+        adm_dt = row["admission_dttm"]
+        if pd.notna(onset_dt) and pd.notna(adm_dt):
+            day = (onset_dt - adm_dt).days + 1
+            return 1 if day <= 2 else 0
+        return None
+
+    onset_src["onset_community1_hospital0"] = onset_src.apply(_onset_type, axis=1)
+    analysis_df = analysis_df.merge(
+        onset_src[["hospitalization_id", "onset_community1_hospital0"]],
+        on="hospitalization_id",
+        how="left",
+    )
+
+    # --- 4. SOFA (definition-specific: wl SOFA for wl rows, wol SOFA for wol rows) ---
+    sofa_wl_pd = sofa_wl_df.to_pandas()
+    sofa_wol_pd = sofa_wol_df.to_pandas()
+    sofa_wl_map = sofa_wl_pd.set_index("hospitalization_id")["sofa_total"]
+    sofa_wol_map = sofa_wol_pd.set_index("hospitalization_id")["sofa_total"]
+
+    analysis_df["highest_sofa_before_meet_ASE_criteria"] = None
+    wl_mask = analysis_df["defined_w_lactic"] == 1
+    wol_mask = analysis_df["defined_w_lactic"] == 0
+    analysis_df.loc[wl_mask, "highest_sofa_before_meet_ASE_criteria"] = (
+        analysis_df.loc[wl_mask, "hospitalization_id"].map(sofa_wl_map).values
+    )
+    analysis_df.loc[wol_mask, "highest_sofa_before_meet_ASE_criteria"] = (
+        analysis_df.loc[wol_mask, "hospitalization_id"].map(sofa_wol_map).values
+    )
+
+    # Fallback: fill remaining NaN SOFA with full-hospitalization SOFA
+    sofa_full_pd = sofa_full_df.to_pandas()
+    sofa_full_map = sofa_full_pd.set_index("hospitalization_id")["sofa_total"]
+    null_mask = analysis_df["highest_sofa_before_meet_ASE_criteria"].isna()
+    analysis_df.loc[null_mask, "highest_sofa_before_meet_ASE_criteria"] = (
+        analysis_df.loc[null_mask, "hospitalization_id"].map(sofa_full_map).values
+    )
+
+    # --- 5. CCI ---
+    cci_merge = (
+        cci_df.reset_index()[["hospitalization_id", "cci_score"]]
+        if "hospitalization_id" not in cci_df.columns
+        else cci_df[["hospitalization_id", "cci_score"]]
+    )
+    cci_merge = cci_merge.rename(columns={"cci_score": "cci"})
+    analysis_df = analysis_df.merge(cci_merge, on="hospitalization_id", how="left")
+
+    # --- 6. Lactate ordering rate ---
+    analysis_df["year"] = analysis_df["admission_dttm"].dt.year
+    analysis_df = analysis_df.merge(
+        lactate_rate[["hospital_id", "admission_year", "lactate_order_per_1000_patient_days"]].rename(
+            columns={"admission_year": "year"}
+        ),
+        on=["hospital_id", "year"],
+        how="left",
+    )
+
+    # --- 7. Hospitalizations from ED per year ---
+    ed_hosp_per_year = (
+        final_cohort
+        .groupby(["hospital_id", final_cohort["admission_dttm"].dt.year])
+        .size()
+        .reset_index(name="hospitalizations_from_ed_per_year")
+        .rename(columns={"admission_dttm": "year"})
+    )
+    analysis_df = analysis_df.merge(ed_hosp_per_year, on=["hospital_id", "year"], how="left")
+
+    # --- 8. Select final columns & save ---
+    final_cols = [
+        "hospitalization_id",
+        "ASE",
+        "defined_w_lactic",
+        "onset_community1_hospital0",
+        "age",
+        "sex",
+        "cci",
+        "highest_sofa_before_meet_ASE_criteria",
+        "hospital_id",
+        "hospital_type",
+        "lactate_order_per_1000_patient_days",
+        "year",
+        "hospitalizations_from_ed_per_year",
+    ]
+    analysis_df = analysis_df[final_cols]
+
+    analysis_path = OUTPUT_DIR / "analysis_dataset.parquet"
+    analysis_df.to_parquet(analysis_path, index=False)
+
+    # Verification
+    n_hosp = ase_results["hospitalization_id"].nunique()
+    print(f"Analysis dataset saved to: {analysis_path}")
+    print(f"Shape: {analysis_df.shape} (expected {n_hosp * 2} rows)")
+    print(f"ASE=1 (wl=1): {analysis_df.loc[analysis_df['defined_w_lactic']==1, 'ASE'].sum():,}")
+    print(f"ASE=1 (wl=0): {analysis_df.loc[analysis_df['defined_w_lactic']==0, 'ASE'].sum():,}")
+    print(f"SOFA non-null: {analysis_df['highest_sofa_before_meet_ASE_criteria'].notna().sum():,}")
+    print(f"CCI non-null: {analysis_df['cci'].notna().sum():,}")
+    print(f"Columns: {list(analysis_df.columns)}")
+    print(f"hospital_type values: {analysis_df['hospital_type'].value_counts().to_dict()}")
+    print(f"year range: {analysis_df['year'].min()}–{analysis_df['year'].max()}")
+    print(f"hospitalizations_from_ed_per_year non-null: {analysis_df['hospitalizations_from_ed_per_year'].notna().sum():,}")
     return
 
 
