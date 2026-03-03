@@ -636,12 +636,12 @@ def _(
     )
 
     print(f"SOFA results: {len(sofa_wl_df):,} with-lactate, {len(sofa_wol_df):,} without-lactate, {len(sofa_full_df):,} full-hosp")
-    return sofa_wl_df, sofa_wol_df, sofa_full_df
+    return sofa_full_df, sofa_wl_df, sofa_wol_df
 
 
 @app.cell
 def _(
-    OUTPUT_DIR,
+    PHI_DIR,
     ase_results,
     cci_df,
     final_cohort,
@@ -784,7 +784,7 @@ def _(
     ]
     analysis_df = analysis_df[final_cols]
 
-    analysis_path = OUTPUT_DIR / "analysis_dataset.parquet"
+    analysis_path = PHI_DIR / "analysis_dataset.parquet"
     analysis_df.to_parquet(analysis_path, index=False)
 
     # Verification
