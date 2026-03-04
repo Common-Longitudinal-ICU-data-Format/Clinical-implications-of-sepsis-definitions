@@ -514,7 +514,7 @@ def _(DATA_DIR, FILETYPE, Labs, OUTPUT_DIR, TIMEZONE, adt, hospitalization):
     print(f"Lactate orders per 1,000 patient-days saved to: {lactate_rate_path}")
     print(f"Shape: {lactate_rate.shape}")
     print(lactate_rate.head(10))
-    return (lactate_rate,)
+    return lactate_counts, lactate_rate
 
 
 @app.cell
@@ -543,46 +543,24 @@ def _(
     DATA_DIR,
     FILETYPE,
     TIMEZONE,
-    ase_results,
     compute_sofa_polars,
     final_cohort,
     pd,
     pl,
 ):
-    # Build SOFA cohort: only ASE-positive rows, with per-definition time windows
-    # Each row gets a unique encounter_block so SOFA is computed over
-    # [admission → ASE onset] separately for each definition
+    # Build SOFA cohort with two window types per hospitalization:
+    # 1. 24-hour window (admission → admission + 24h) — standardized severity measure
+    # 2. Full-hospitalization window (admission → discharge) — fallback
 
-    # admission_dttm lives in final_cohort, not ase_results
-    adm_dttm = final_cohort[["hospitalization_id", "admission_dttm"]].drop_duplicates(
+    # 24-hour SOFA (admission → admission + 24h, for all hospitalizations)
+    sofa_24h = final_cohort[["hospitalization_id", "admission_dttm"]].drop_duplicates(
         subset=["hospitalization_id"]
-    )
+    ).copy()
+    sofa_24h["encounter_block"] = sofa_24h["hospitalization_id"].astype(str) + "_24h"
+    sofa_24h["end_dttm"] = sofa_24h["admission_dttm"] + pd.Timedelta(hours=24)
+    sofa_24h = sofa_24h.rename(columns={"admission_dttm": "start_dttm"})
 
-    # With-lactate definition (sepsis==1)
-    wl = ase_results.loc[
-        ase_results["sepsis"] == 1,
-        ["hospitalization_id", "ase_onset_w_lactate_dttm"],
-    ].copy()
-    wl = wl.merge(adm_dttm, on="hospitalization_id", how="left")
-    wl["encounter_block"] = wl["hospitalization_id"].astype(str) + "_wl"
-    wl = wl.rename(columns={
-        "admission_dttm": "start_dttm",
-        "ase_onset_w_lactate_dttm": "end_dttm",
-    })
-
-    # Without-lactate definition (sepsis_wo_lactate==1)
-    wol = ase_results.loc[
-        ase_results["sepsis_wo_lactate"] == 1,
-        ["hospitalization_id", "ase_onset_wo_lactate_dttm"],
-    ].copy()
-    wol = wol.merge(adm_dttm, on="hospitalization_id", how="left")
-    wol["encounter_block"] = wol["hospitalization_id"].astype(str) + "_wol"
-    wol = wol.rename(columns={
-        "admission_dttm": "start_dttm",
-        "ase_onset_wo_lactate_dttm": "end_dttm",
-    })
-
-    # Full-hospitalization SOFA (for non-ASE rows: admission → discharge)
+    # Full-hospitalization SOFA (admission → discharge, fallback)
     full_hosp = final_cohort[["hospitalization_id", "admission_dttm", "discharge_dttm"]].drop_duplicates(
         subset=["hospitalization_id"]
     )
@@ -591,13 +569,12 @@ def _(
 
     # Combine and convert to polars for compute_sofa_polars
     sofa_cohort_pl = pl.from_pandas(
-        pd.concat([wl, wol, full_hosp], ignore_index=True)[
+        pd.concat([sofa_24h, full_hosp], ignore_index=True)[
             ["hospitalization_id", "encounter_block", "start_dttm", "end_dttm"]
         ]
     )
     print(f"SOFA cohort: {len(sofa_cohort_pl):,} encounter blocks")
-    print(f"  With-lactate blocks: {len(wl):,}")
-    print(f"  Without-lactate blocks: {len(wol):,}")
+    print(f"  24-hour blocks: {len(sofa_24h):,}")
     print(f"  Full-hospitalization blocks: {len(full_hosp):,}")
 
     # Compute SOFA scores within each time window
@@ -609,20 +586,12 @@ def _(
         timezone=TIMEZONE,
     )
 
-    # Split results by suffix → per-definition SOFA DataFrames
-    sofa_wl_df = (
+    # Split results by suffix
+    sofa_24h_df = (
         sofa_result_pl
-        .filter(pl.col("encounter_block").str.ends_with("_wl"))
+        .filter(pl.col("encounter_block").str.ends_with("_24h"))
         .with_columns(
-            pl.col("encounter_block").str.replace("_wl$", "").alias("hospitalization_id")
-        )
-        .select(["hospitalization_id", "sofa_total"])
-    )
-    sofa_wol_df = (
-        sofa_result_pl
-        .filter(pl.col("encounter_block").str.ends_with("_wol"))
-        .with_columns(
-            pl.col("encounter_block").str.replace("_wol$", "").alias("hospitalization_id")
+            pl.col("encounter_block").str.replace("_24h$", "").alias("hospitalization_id")
         )
         .select(["hospitalization_id", "sofa_total"])
     )
@@ -635,8 +604,8 @@ def _(
         .select(["hospitalization_id", "sofa_total"])
     )
 
-    print(f"SOFA results: {len(sofa_wl_df):,} with-lactate, {len(sofa_wol_df):,} without-lactate, {len(sofa_full_df):,} full-hosp")
-    return sofa_full_df, sofa_wl_df, sofa_wol_df
+    print(f"SOFA results: {len(sofa_24h_df):,} 24-hour, {len(sofa_full_df):,} full-hosp")
+    return sofa_24h_df, sofa_full_df
 
 
 @app.cell
@@ -645,11 +614,11 @@ def _(
     ase_results,
     cci_df,
     final_cohort,
+    lactate_counts,
     lactate_rate,
     pd,
+    sofa_24h_df,
     sofa_full_df,
-    sofa_wl_df,
-    sofa_wol_df,
 ):
     # --- 1. Stack into 2 rows per hospitalization ---
     melt_src = ase_results[["hospitalization_id", "sepsis", "sepsis_wo_lactate"]].copy()
@@ -713,27 +682,16 @@ def _(
         how="left",
     )
 
-    # --- 4. SOFA (definition-specific: wl SOFA for wl rows, wol SOFA for wol rows) ---
-    sofa_wl_pd = sofa_wl_df.to_pandas()
-    sofa_wol_pd = sofa_wol_df.to_pandas()
-    sofa_wl_map = sofa_wl_pd.set_index("hospitalization_id")["sofa_total"]
-    sofa_wol_map = sofa_wol_pd.set_index("hospitalization_id")["sofa_total"]
+    # --- 4. SOFA admission-to-24h (fixed window, same for both rows) ---
+    sofa_24h_pd = sofa_24h_df.to_pandas()
+    sofa_24h_map = sofa_24h_pd.set_index("hospitalization_id")["sofa_total"]
+    analysis_df["worst_sofa_admission_to_24h"] = analysis_df["hospitalization_id"].map(sofa_24h_map)
 
-    analysis_df["highest_sofa_before_meet_ASE_criteria"] = None
-    wl_mask = analysis_df["defined_w_lactic"] == 1
-    wol_mask = analysis_df["defined_w_lactic"] == 0
-    analysis_df.loc[wl_mask, "highest_sofa_before_meet_ASE_criteria"] = (
-        analysis_df.loc[wl_mask, "hospitalization_id"].map(sofa_wl_map).values
-    )
-    analysis_df.loc[wol_mask, "highest_sofa_before_meet_ASE_criteria"] = (
-        analysis_df.loc[wol_mask, "hospitalization_id"].map(sofa_wol_map).values
-    )
-
-    # Fallback: fill remaining NaN SOFA with full-hospitalization SOFA
+    # Fallback: fill remaining NaN with full-hospitalization SOFA
     sofa_full_pd = sofa_full_df.to_pandas()
     sofa_full_map = sofa_full_pd.set_index("hospitalization_id")["sofa_total"]
-    null_mask = analysis_df["highest_sofa_before_meet_ASE_criteria"].isna()
-    analysis_df.loc[null_mask, "highest_sofa_before_meet_ASE_criteria"] = (
+    null_mask = analysis_df["worst_sofa_admission_to_24h"].isna()
+    analysis_df.loc[null_mask, "worst_sofa_admission_to_24h"] = (
         analysis_df.loc[null_mask, "hospitalization_id"].map(sofa_full_map).values
     )
 
@@ -746,7 +704,15 @@ def _(
     cci_merge = cci_merge.rename(columns={"cci_score": "cci"})
     analysis_df = analysis_df.merge(cci_merge, on="hospitalization_id", how="left")
 
-    # --- 6. Lactate ordering rate ---
+    # --- 6. Presumed infection (hospitalization-level) ---
+    pi_map = ase_results.drop_duplicates("hospitalization_id").set_index("hospitalization_id")["presumed_infection"]
+    analysis_df["presumed_infection"] = analysis_df["hospitalization_id"].map(pi_map).fillna(0).astype(int)
+
+    # --- 7. Any lactate ordered (hospitalization-level) ---
+    lactate_flag = lactate_counts.set_index("hospitalization_id")["lactate_orders"].gt(0).astype(int)
+    analysis_df["any_lactate_ordered"] = analysis_df["hospitalization_id"].map(lactate_flag).fillna(0).astype(int)
+
+    # --- 8. Lactate ordering rate ---
     analysis_df["year"] = analysis_df["admission_dttm"].dt.year
     analysis_df = analysis_df.merge(
         lactate_rate[["hospital_id", "admission_year", "lactate_order_per_1000_patient_days"]].rename(
@@ -756,7 +722,7 @@ def _(
         how="left",
     )
 
-    # --- 7. Hospitalizations from ED per year ---
+    # --- 9. Hospitalizations from ED per year ---
     ed_hosp_per_year = (
         final_cohort
         .groupby(["hospital_id", final_cohort["admission_dttm"].dt.year])
@@ -766,7 +732,7 @@ def _(
     )
     analysis_df = analysis_df.merge(ed_hosp_per_year, on=["hospital_id", "year"], how="left")
 
-    # --- 8. Select final columns & save ---
+    # --- 10. Select final columns & save ---
     final_cols = [
         "hospitalization_id",
         "ASE",
@@ -775,7 +741,9 @@ def _(
         "age",
         "sex",
         "cci",
-        "highest_sofa_before_meet_ASE_criteria",
+        "worst_sofa_admission_to_24h",
+        "any_lactate_ordered",
+        "presumed_infection",
         "hospital_id",
         "hospital_type",
         "lactate_order_per_1000_patient_days",
@@ -793,8 +761,10 @@ def _(
     print(f"Shape: {analysis_df.shape} (expected {n_hosp * 2} rows)")
     print(f"ASE=1 (wl=1): {analysis_df.loc[analysis_df['defined_w_lactic']==1, 'ASE'].sum():,}")
     print(f"ASE=1 (wl=0): {analysis_df.loc[analysis_df['defined_w_lactic']==0, 'ASE'].sum():,}")
-    print(f"SOFA non-null: {analysis_df['highest_sofa_before_meet_ASE_criteria'].notna().sum():,}")
+    print(f"SOFA non-null: {analysis_df['worst_sofa_admission_to_24h'].notna().sum():,}")
     print(f"CCI non-null: {analysis_df['cci'].notna().sum():,}")
+    print(f"any_lactate_ordered=1: {analysis_df['any_lactate_ordered'].sum():,}")
+    print(f"presumed_infection=1: {analysis_df['presumed_infection'].sum():,}")
     print(f"Columns: {list(analysis_df.columns)}")
     print(f"hospital_type values: {analysis_df['hospital_type'].value_counts().to_dict()}")
     print(f"year range: {analysis_df['year'].min()}–{analysis_df['year'].max()}")
