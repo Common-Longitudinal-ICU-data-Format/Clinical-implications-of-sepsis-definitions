@@ -89,11 +89,11 @@ def _(PHI_DIR, SITE_NAME, pd):
 @app.cell
 def _(mo):
     mo.md(r"""
-    ## Yearly ED Hospitalizations by Hospital
+    ## Monthly ED Hospitalizations by Hospital
 
     Since the entire cohort is ED-admitted, this section summarizes the average
-    yearly adult hospitalizations from the ED, stratified by hospital and hospital type.
-    Descriptive statistics (mean, SD, median, IQR) of yearly ED visit counts are reported.
+    monthly adult hospitalizations from the ED, stratified by hospital and hospital type.
+    Descriptive statistics (mean, SD, median, IQR) of monthly ED visit counts are reported.
     """)
     return
 
@@ -102,13 +102,13 @@ def _(mo):
 def _(cohort_df, pd, mo):
     import numpy as np
 
-    # Derive year from admission datetime
+    # Derive month from admission datetime
     _cohort = cohort_df.copy()
-    _cohort["year"] = pd.to_datetime(_cohort["admission_dttm"]).dt.year
+    _cohort["month"] = pd.to_datetime(_cohort["admission_dttm"]).dt.to_period("M").astype(str)
 
-    # Count hospitalizations per (year, hospital_id, hospital_type)
-    yearly_hosp_counts = (
-        _cohort.groupby(["year", "hospital_id", "hospital_type"])
+    # Count hospitalizations per (month, hospital_id, hospital_type)
+    monthly_hosp_counts = (
+        _cohort.groupby(["month", "hospital_id", "hospital_type"])
         .size()
         .reset_index(name="n_hospitalizations")
     )
@@ -121,49 +121,49 @@ def _(cohort_df, pd, mo):
             "median": group["n_hospitalizations"].median(),
             "q1": group["n_hospitalizations"].quantile(0.25),
             "q3": group["n_hospitalizations"].quantile(0.75),
-            "n_years": len(group),
+            "n_months": len(group),
         })
 
     hospital_summary = (
-        yearly_hosp_counts
+        monthly_hosp_counts
         .groupby(["hospital_id", "hospital_type"])
         .apply(_summary)
         .reset_index()
     )
 
-    # Overall summary (all hospitals combined per year)
-    yearly_totals = (
-        _cohort.groupby("year")
+    # Overall summary (all hospitals combined per month)
+    monthly_totals = (
+        _cohort.groupby("month")
         .size()
         .reset_index(name="n_hospitalizations")
     )
     overall_row = pd.DataFrame([{
         "hospital_id": "Overall",
         "hospital_type": "All",
-        "mean": yearly_totals["n_hospitalizations"].mean(),
-        "sd": yearly_totals["n_hospitalizations"].std(),
-        "median": yearly_totals["n_hospitalizations"].median(),
-        "q1": yearly_totals["n_hospitalizations"].quantile(0.25),
-        "q3": yearly_totals["n_hospitalizations"].quantile(0.75),
-        "n_years": len(yearly_totals),
+        "mean": monthly_totals["n_hospitalizations"].mean(),
+        "sd": monthly_totals["n_hospitalizations"].std(),
+        "median": monthly_totals["n_hospitalizations"].median(),
+        "q1": monthly_totals["n_hospitalizations"].quantile(0.25),
+        "q3": monthly_totals["n_hospitalizations"].quantile(0.75),
+        "n_months": len(monthly_totals),
     }])
 
-    yearly_ed_summary = pd.concat([hospital_summary, overall_row], ignore_index=True)
+    monthly_ed_summary = pd.concat([hospital_summary, overall_row], ignore_index=True)
 
     # Round for display
     for _col in ["mean", "sd", "median", "q1", "q3"]:
-        yearly_ed_summary[_col] = yearly_ed_summary[_col].round(1)
+        monthly_ed_summary[_col] = monthly_ed_summary[_col].round(1)
 
-    print("Yearly ED Hospitalizations — Summary Statistics")
+    print("Monthly ED Hospitalizations — Summary Statistics")
     print("=" * 70)
-    print(yearly_ed_summary.to_string(index=False))
-    print(f"\nYears covered: {sorted(_cohort['year'].unique())}")
+    print(monthly_ed_summary.to_string(index=False))
+    print(f"\nMonths covered: {sorted(_cohort['month'].unique())}")
 
     mo.md(f"""
     ### Summary Table
-    {mo.as_html(yearly_ed_summary)}
+    {mo.as_html(monthly_ed_summary)}
     """)
-    return yearly_hosp_counts, yearly_ed_summary
+    return monthly_hosp_counts, monthly_ed_summary
 
 
 @app.cell
@@ -809,11 +809,11 @@ def _(mo):
 
 @app.cell
 def _(ase_df, go, pd):
-    def _build_onset_fig(df, title):
+    def _build_onset_fig(df, title, dttm_col):
         """Build a community vs hospital onset line chart from filtered ASE df."""
         df = df.copy()
-        df['blood_culture_dttm'] = pd.to_datetime(df['blood_culture_dttm'])
-        df['year_month'] = df['blood_culture_dttm'].dt.to_period('M')
+        df[dttm_col] = pd.to_datetime(df[dttm_col])
+        df['year_month'] = df[dttm_col].dt.to_period('M')
         monthly = df.groupby(['year_month', 'type']).size().reset_index(name='count')
         pivot = monthly.pivot(index='year_month', columns='type', values='count').fillna(0)
         pivot.index = pivot.index.astype(str)
@@ -856,12 +856,14 @@ def _(ase_df, go, pd):
     # ASE WITH lactate
     yearly_onset_w_fig, yearly_onset_w_data = _build_onset_fig(
         ase_df[ase_df['sepsis'] == 1],
-        "Monthly ASE Cases by Onset Type — WITH Lactate"
+        "Monthly ASE Cases by Onset Type — WITH Lactate",
+        dttm_col="ase_onset_w_lactate_dttm"
     )
     # ASE WITHOUT lactate
     yearly_onset_wo_fig, yearly_onset_wo_data = _build_onset_fig(
         ase_df[ase_df['sepsis_wo_lactate'] == 1],
-        "Monthly ASE Cases by Onset Type — WITHOUT Lactate"
+        "Monthly ASE Cases by Onset Type — WITHOUT Lactate",
+        dttm_col="ase_onset_wo_lactate_dttm"
     )
 
     print("WITH Lactate onset:")
@@ -1065,8 +1067,8 @@ def _(
     yearly_onset_w_fig,
     yearly_onset_wo_data,
     yearly_onset_wo_fig,
-    yearly_hosp_counts,
-    yearly_ed_summary,
+    monthly_hosp_counts,
+    monthly_ed_summary,
 ):
     # Create subdirectories for plots and data
     PLOTS_DIR = OUTPUT_DIR / "plots"
@@ -1323,13 +1325,13 @@ def _(
     qad_lactate_wo_data.to_csv(str(qad_lac_wo_csv), index=False)
     print(f"Saved: {qad_lac_wo_csv}")
 
-    yearly_ed_hosp_csv = DATA_DIR / "yearly_ed_hospitalizations.csv"
-    yearly_hosp_counts.to_csv(str(yearly_ed_hosp_csv), index=False)
-    print(f"Saved: {yearly_ed_hosp_csv}")
+    monthly_ed_hosp_csv = DATA_DIR / "monthly_ed_hospitalizations.csv"
+    monthly_hosp_counts.to_csv(str(monthly_ed_hosp_csv), index=False)
+    print(f"Saved: {monthly_ed_hosp_csv}")
 
-    yearly_ed_summary_csv = DATA_DIR / "yearly_ed_summary_stats.csv"
-    yearly_ed_summary.to_csv(str(yearly_ed_summary_csv), index=False)
-    print(f"Saved: {yearly_ed_summary_csv}")
+    monthly_ed_summary_csv = DATA_DIR / "monthly_ed_summary_stats.csv"
+    monthly_ed_summary.to_csv(str(monthly_ed_summary_csv), index=False)
+    print(f"Saved: {monthly_ed_summary_csv}")
 
     top20_meds_w_csv = DATA_DIR / "top20_qad_meds_w_lactate.csv"
     top20_meds_w_lactate.to_csv(str(top20_meds_w_csv), index=False)

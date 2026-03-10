@@ -380,7 +380,7 @@ def _(PHI_DIR, ase_results):
 
 
 @app.cell
-def _(OUTPUT_DIR, ase_results, pd):
+def _(OUTPUT_DIR, ase_results, final_cohort, pd):
     # Organ dysfunction breakdown across 3 ASE groups
     organ_cols = {
         'vasopressor': 'vasopressor_dttm',
@@ -392,12 +392,18 @@ def _(OUTPUT_DIR, ase_results, pd):
     }
     organ_cols_no_lactate = {k: v for k, v in organ_cols.items() if k != 'lactate'}
 
+    # Merge patient_id from final_cohort (local to this cell)
+    ase_with_pid = ase_results.merge(
+        final_cohort[["hospitalization_id", "patient_id"]].drop_duplicates(),
+        on="hospitalization_id", how="left"
+    )
+
     # Group 1: ASE with lactate criterion AND actually had elevated lactate
-    group1 = ase_results[(ase_results['sepsis'] == 1) & (ase_results['lactate_dttm'].notna())]
+    group1 = ase_with_pid[(ase_with_pid['sepsis'] == 1) & (ase_with_pid['lactate_dttm'].notna())]
     # Group 2: All ASE (6-criterion definition)
-    group2 = ase_results[ase_results['sepsis'] == 1]
+    group2 = ase_with_pid[ase_with_pid['sepsis'] == 1]
     # Group 3: ASE without lactate criterion (5-criterion definition)
-    group3 = ase_results[ase_results['sepsis_wo_lactate'] == 1]
+    group3 = ase_with_pid[ase_with_pid['sepsis_wo_lactate'] == 1]
 
     groups = {
         'ASE_with_lactate_AND_met_lactate': group1,
@@ -408,6 +414,8 @@ def _(OUTPUT_DIR, ase_results, pd):
     rows = {}
     for gname, gdf in groups.items():
         n_total = len(gdf)
+        rows.setdefault('n_hospitalizations', {})[gname] = gdf['hospitalization_id'].nunique()
+        rows.setdefault('n_patients', {})[gname] = gdf['patient_id'].nunique()
         # Per-organ counts and percentages
         for organ, col in organ_cols.items():
             n = int(gdf[col].notna().sum())
@@ -515,6 +523,42 @@ def _(DATA_DIR, FILETYPE, Labs, OUTPUT_DIR, TIMEZONE, adt, hospitalization):
     print(f"Shape: {lactate_rate.shape}")
     print(lactate_rate.head(10))
     return lactate_counts, lactate_rate
+
+
+@app.cell
+def _(mo):
+    mo.md(r"""
+    ## Step 8b: Monthly Hospitalization Counts
+    """)
+    return
+
+
+@app.cell
+def _(hospitalization, OUTPUT_DIR, pd):
+    # Total hospitalizations per month (all, regardless of admission type or ASE)
+    all_hosp_monthly = hospitalization.df[["hospitalization_id", "admission_dttm"]].copy()
+    all_hosp_monthly = all_hosp_monthly.dropna(subset=["admission_dttm"])
+    all_hosp_monthly = all_hosp_monthly[
+        (all_hosp_monthly["admission_dttm"].dt.year >= 2018) &
+        (all_hosp_monthly["admission_dttm"].dt.year <= 2024)
+    ]
+    all_hosp_monthly["month"] = all_hosp_monthly["admission_dttm"].dt.to_period("M").astype(str)
+
+    month_counts = (
+        all_hosp_monthly
+        .groupby("month")["hospitalization_id"]
+        .nunique()
+        .reset_index(name="n_hospitalizations")
+    )
+
+    # Cell suppression: replace counts < 11 with -99
+    month_counts.loc[month_counts["n_hospitalizations"] < 11, "n_hospitalizations"] = -99
+
+    month_counts.to_csv(OUTPUT_DIR / "month_hospitalizations.csv", index=False)
+    print(f"Monthly hospitalization counts saved to: {OUTPUT_DIR / 'month_hospitalizations.csv'}")
+    print(f"Shape: {month_counts.shape}")
+    print(month_counts.to_string(index=False))
+    return
 
 
 @app.cell

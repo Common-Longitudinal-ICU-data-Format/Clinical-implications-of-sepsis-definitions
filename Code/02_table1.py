@@ -347,6 +347,12 @@ def _(ase_df, hosp_ids, micro, pd):
     # Window BC: cultures within ±2 days
     window_bc_cultures = micro_with_index[abs(micro_with_index['days_from_index']) <= 2].copy()
 
+    # Load contaminant organism list and reclassify (case-insensitive)
+    _contaminants_df = pd.read_csv("code/contaminants_organism_category.csv")
+    _contaminant_set = set(_contaminants_df['organism_category'].str.lower())
+    index_bc_cultures.loc[index_bc_cultures['organism_category'].str.lower().isin(_contaminant_set), 'organism_category'] = 'contaminant'
+    window_bc_cultures.loc[window_bc_cultures['organism_category'].str.lower().isin(_contaminant_set), 'organism_category'] = 'contaminant'
+
     # Determine if index BC was positive
     index_bc_positive = index_bc_cultures[
         (index_bc_cultures['organism_category'].notna()) &
@@ -371,15 +377,23 @@ def _(ase_df, hosp_ids, micro, pd):
     index_bc_df = pd.merge(index_bc_df, window_positive_counts, on='hospitalization_id', how='left')
     index_bc_df['bc_positive_count_in_window'] = index_bc_df['bc_positive_count_in_window'].fillna(0)
 
-    # Top 20 organisms from positive INDEX blood cultures
-    index_bc_organisms = index_bc_positive['organism_category'].value_counts().head(20)
+    # Top 20 organisms from positive INDEX blood cultures + "none_of_the_above"
+    _index_all = index_bc_positive['organism_category'].value_counts()
+    index_bc_organisms = _index_all.head(20)
+    _index_rest = _index_all.iloc[20:].sum()
+    if _index_rest > 0:
+        index_bc_organisms = pd.concat([index_bc_organisms, pd.Series({'none_of_the_above': _index_rest})])
 
-    # Top 20 organisms from ALL positive cultures in window
+    # Top 20 organisms from ALL positive cultures in window + "none_of_the_above"
     window_positive = window_bc_cultures[
         (window_bc_cultures['organism_category'].notna()) &
         (window_bc_cultures['organism_category'] != 'no_growth')
     ]
-    window_bc_organisms = window_positive['organism_category'].value_counts().head(20)
+    _window_all = window_positive['organism_category'].value_counts()
+    window_bc_organisms = _window_all.head(20)
+    _window_rest = _window_all.iloc[20:].sum()
+    if _window_rest > 0:
+        window_bc_organisms = pd.concat([window_bc_organisms, pd.Series({'none_of_the_above': _window_rest})])
 
     print(f"Index BC positive: {len(index_bc_positive_hosp):,} patients")
     print(f"Index BC organisms: {len(index_bc_organisms)} unique categories")
@@ -1343,12 +1357,16 @@ def _(
 
     # Save index BC organisms (positive index blood cultures only)
     index_bc_org_path = OUTPUT_DIR / "index_bc_top20_organisms.csv"
-    index_bc_organisms.to_csv(index_bc_org_path)
+    _idx_org_df = index_bc_organisms.reset_index()
+    _idx_org_df.columns = ['organism_category', 'count']
+    _idx_org_df.to_csv(index_bc_org_path, index=False)
     print(f"Index BC organisms saved to: {index_bc_org_path}")
 
     # Save window BC organisms (all positive cultures in ±2 day window)
     window_bc_org_path = OUTPUT_DIR / "window_bc_top20_organisms.csv"
-    window_bc_organisms.to_csv(window_bc_org_path)
+    _win_org_df = window_bc_organisms.reset_index()
+    _win_org_df.columns = ['organism_category', 'count']
+    _win_org_df.to_csv(window_bc_org_path, index=False)
     print(f"Window BC organisms saved to: {window_bc_org_path}")
 
     # Save organ failure sequence times
@@ -1456,7 +1474,6 @@ def _(
     analysis_df,
     labs_lactate,
     pd,
-    summarize_median_iqr,
 ):
     # Compute lactate counts before each criteria was met
     lactate_df = labs_lactate.df.copy()
@@ -1493,40 +1510,47 @@ def _(
         lactates_before_ase_wo_lactate=('before_ase_wo_lactate', 'sum')
     ).reset_index()
 
-    # Merge back to analysis_df to get group info
-    lactate_counts_with_groups = pd.merge(
-        lactate_counts,
-        analysis_df[['hospitalization_id', 'admission_dttm', 'group_no_presumed_infection', 'group_presumed_infection', 'group_ase_w_lactate', 'group_ase_wo_lactate', 'group_lactate_only_ase']],
-        on='hospitalization_id',
-        how='left'
+    # --- Step 4: Start from sepsis=1 patients, join lactate counts ---
+    ase_patients = analysis_df[analysis_df['sepsis'] == 1][
+        ['hospitalization_id', 'ase_onset_w_lactate_dttm']
+    ].copy()
+    ase_patients['ase_onset_w_lactate_dttm'] = pd.to_datetime(
+        ase_patients['ase_onset_w_lactate_dttm'], errors='coerce'
     )
 
-    # Derive year_month from admission_dttm
-    lactate_counts_with_groups['year_month'] = pd.to_datetime(
-        lactate_counts_with_groups['admission_dttm']
-    ).dt.to_period('M').astype(str)
+    ase_with_lactate_counts = pd.merge(
+        ase_patients, lactate_counts, on='hospitalization_id', how='left'
+    )
+    # Patients with no lactate labs → 0 counts
+    for _col in ['lactates_before_presumed_infection',
+                 'lactates_before_ase_w_lactate',
+                 'lactates_before_ase_wo_lactate']:
+        ase_with_lactate_counts[_col] = ase_with_lactate_counts[_col].fillna(0)
 
-    # Group definitions: group_name -> (flag_column, lactate_count_column or None)
-    group_defs = {
-        'No Presumed Infection': ('group_no_presumed_infection', None),
-        'Presumed Infection': ('group_presumed_infection', 'lactates_before_presumed_infection'),
-        'ASE with Lactate': ('group_ase_w_lactate', 'lactates_before_ase_w_lactate'),
-        'ASE without Lactate': ('group_ase_wo_lactate', 'lactates_before_ase_wo_lactate'),
-        'Lactate-only ASE': ('group_lactate_only_ase', 'lactates_before_ase_w_lactate'),
+    # --- Step 5: year_month from ASE onset ---
+    ase_with_lactate_counts['year_month'] = (
+        ase_with_lactate_counts['ase_onset_w_lactate_dttm']
+        .dt.to_period('M').astype(str)
+    )
+
+    # --- Step 6: Descriptive stats per month ---
+    count_cols = {
+        'before_pi': 'lactates_before_presumed_infection',
+        'before_ase_w': 'lactates_before_ase_w_lactate',
+        'before_ase_wo': 'lactates_before_ase_wo_lactate',
     }
 
-    # Create summary pivoted by year_month (rows) x groups (columns)
     lactate_summary_rows = []
-    for ym in sorted(lactate_counts_with_groups['year_month'].unique()):
-        ym_data = lactate_counts_with_groups[lactate_counts_with_groups['year_month'] == ym]
-        _row = {'year_month': ym}
-        for group_name, (flag_col, lactate_col) in group_defs.items():
-            subset = ym_data[ym_data[flag_col]]
-            _row[f'{group_name}_N'] = len(subset)
-            if lactate_col:
-                _row[f'{group_name}_lactates_median_iqr'] = summarize_median_iqr(subset, lactate_col)
-            else:
-                _row[f'{group_name}_lactates_median_iqr'] = 'N/A'
+    for ym in sorted(ase_with_lactate_counts['year_month'].dropna().unique()):
+        ym_data = ase_with_lactate_counts[ase_with_lactate_counts['year_month'] == ym]
+        _row = {'year_month': ym, 'N': len(ym_data)}
+        for _prefix, _col in count_cols.items():
+            _vals = ym_data[_col].dropna()
+            _row[f'{_prefix}_median'] = _vals.median() if len(_vals) else None
+            _row[f'{_prefix}_q25'] = _vals.quantile(0.25) if len(_vals) else None
+            _row[f'{_prefix}_q75'] = _vals.quantile(0.75) if len(_vals) else None
+            _row[f'{_prefix}_mean'] = _vals.mean() if len(_vals) else None
+            _row[f'{_prefix}_sd'] = _vals.std() if len(_vals) else None
         lactate_summary_rows.append(_row)
 
     lactate_summary = pd.DataFrame(lactate_summary_rows)
