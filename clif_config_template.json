@@ -3,5 +3,6 @@
   "data_directory": "/path/to/your/clif/tables",
   "filetype": "parquet",
   "timezone": "America/Chicago",
-  "output_directory": "./output"
+  "output_directory": "./output_to_BOX",
+  "phi_directory": "./phi"
 }

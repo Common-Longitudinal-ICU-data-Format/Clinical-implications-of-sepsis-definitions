@@ -10,3 +10,5 @@ clif_config.json
 *.pyc
 *.html
 *.log
+*.phi
+phi/

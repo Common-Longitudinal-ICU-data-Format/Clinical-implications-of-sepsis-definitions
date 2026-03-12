@@ -134,7 +134,7 @@ def _(DATA_DIR, FILETYPE, RespiratorySupport, TIMEZONE, hosp_ids):
         timezone=TIMEZONE,
         filters={
             'hospitalization_id': hosp_ids,
-            'device_category': ['IMV', 'NIPPV', 'High Flow NC']
+            'device_category': ['IMV', 'imv', 'NIPPV', 'nippv', 'High Flow NC', 'high flow nc']
         }
     )
     print(f"Respiratory support: {len(resp.df):,} rows")
@@ -229,7 +229,7 @@ def _(mo):
 def _(adt, hosp_ids, pd):
     # Compute ICU indicators - VECTORIZED (no for loops)
     adt_raw = adt.df.copy()
-    icu_stays = adt_raw[adt_raw['location_category'] == 'icu'].copy()
+    icu_stays = adt_raw[adt_raw['location_category'].str.lower() == 'icu'].copy()
 
     # Start with base DataFrame
     icu_df = pd.DataFrame({'hospitalization_id': hosp_ids})
@@ -281,9 +281,9 @@ def _(hosp_ids, pd, resp):
     resp_raw = resp.df.copy()
     resp_df = pd.DataFrame({'hospitalization_id': hosp_ids})
 
-    hosp_imv = set(resp_raw[resp_raw['device_category'] == 'IMV']['hospitalization_id'].unique())
-    hosp_nippv = set(resp_raw[resp_raw['device_category'] == 'NIPPV']['hospitalization_id'].unique())
-    hosp_hfno = set(resp_raw[resp_raw['device_category'] == 'High Flow NC']['hospitalization_id'].unique())
+    hosp_imv = set(resp_raw[resp_raw['device_category'].str.lower() == 'imv']['hospitalization_id'].unique())
+    hosp_nippv = set(resp_raw[resp_raw['device_category'].str.lower() == 'nippv']['hospitalization_id'].unique())
+    hosp_hfno = set(resp_raw[resp_raw['device_category'].str.lower() == 'high flow nc']['hospitalization_id'].unique())
 
     resp_df['had_imv'] = resp_df['hospitalization_id'].isin(hosp_imv)
     resp_df['had_nippv'] = resp_df['hospitalization_id'].isin(hosp_nippv)
@@ -307,9 +307,13 @@ def _(hosp_ids, meds_cont, pd):
 def _(hosp_ids, micro, pd):
     # Compute microbiology indicators - VECTORIZED
     micro_raw = micro.df.copy()
+    micro_raw = micro_raw[micro_raw['method_category'].str.lower() == 'culture']
+    micro_raw['result_dttm'] = pd.to_datetime(micro_raw['result_dttm'], errors='coerce')
+    _latest_result = micro_raw.groupby(['hospitalization_id', 'collect_dttm'])['result_dttm'].transform('max')
+    micro_raw = micro_raw[micro_raw['result_dttm'] == _latest_result]
     positive_cultures = micro_raw[
         (micro_raw['organism_category'].notna()) &
-        (micro_raw['organism_category'] != 'no_growth')
+        (micro_raw['organism_category'].str.lower() != 'no_growth')
     ]
 
     # Count per hospitalization
@@ -327,6 +331,10 @@ def _(hosp_ids, micro, pd):
 def _(ase_df, hosp_ids, micro, pd):
     # Index BC analysis - match index blood culture to microbiology results
     micro_raw_idx = micro.df.copy()
+    micro_raw_idx = micro_raw_idx[micro_raw_idx['method_category'].str.lower() == 'culture']
+    micro_raw_idx['result_dttm'] = pd.to_datetime(micro_raw_idx['result_dttm'], errors='coerce')
+    _latest_result = micro_raw_idx.groupby(['hospitalization_id', 'collect_dttm'])['result_dttm'].transform('max')
+    micro_raw_idx = micro_raw_idx[micro_raw_idx['result_dttm'] == _latest_result]
     micro_raw_idx['collect_dttm'] = pd.to_datetime(micro_raw_idx['collect_dttm'], errors='coerce')
 
     # Get index BC times from ASE results
@@ -356,7 +364,7 @@ def _(ase_df, hosp_ids, micro, pd):
     # Determine if index BC was positive
     index_bc_positive = index_bc_cultures[
         (index_bc_cultures['organism_category'].notna()) &
-        (index_bc_cultures['organism_category'] != 'no_growth')
+        (index_bc_cultures['organism_category'].str.lower() != 'no_growth')
     ]
     index_bc_positive_hosp = set(index_bc_positive['hospitalization_id'].unique())
 
@@ -372,7 +380,7 @@ def _(ase_df, hosp_ids, micro, pd):
     # Count POSITIVE BCs in window per hospitalization
     window_positive_counts = window_bc_cultures[
         (window_bc_cultures['organism_category'].notna()) &
-        (window_bc_cultures['organism_category'] != 'no_growth')
+        (window_bc_cultures['organism_category'].str.lower() != 'no_growth')
     ].groupby('hospitalization_id').size().reset_index(name='bc_positive_count_in_window')
     index_bc_df = pd.merge(index_bc_df, window_positive_counts, on='hospitalization_id', how='left')
     index_bc_df['bc_positive_count_in_window'] = index_bc_df['bc_positive_count_in_window'].fillna(0)
@@ -387,7 +395,7 @@ def _(ase_df, hosp_ids, micro, pd):
     # Top 20 organisms from ALL positive cultures in window + "none_of_the_above"
     window_positive = window_bc_cultures[
         (window_bc_cultures['organism_category'].notna()) &
-        (window_bc_cultures['organism_category'] != 'no_growth')
+        (window_bc_cultures['organism_category'].str.lower() != 'no_growth')
     ]
     _window_all = window_positive['organism_category'].value_counts()
     window_bc_organisms = _window_all.head(20)
@@ -469,6 +477,7 @@ def _(mo):
 
 @app.cell
 def _(
+    adt,
     ase_df,
     cci_df,
     cohort_df,
@@ -531,6 +540,12 @@ def _(
     analysis_df = analysis_df.merge(cci_df, on='hospitalization_id', how='left')
     analysis_df = analysis_df.merge(first_vital_df, on='hospitalization_id', how='left')
     analysis_df = analysis_df.merge(index_bc_df, on='hospitalization_id', how='left')
+
+    # First ADT in_dttm per hospitalization (earliest encounter time)
+    first_adt_dttm = adt.df.groupby('hospitalization_id')['in_dttm'].min().reset_index()
+    first_adt_dttm.rename(columns={'in_dttm': 'first_adt_dttm'}, inplace=True)
+    first_adt_dttm['first_adt_dttm'] = pd.to_datetime(first_adt_dttm['first_adt_dttm'])
+    analysis_df = analysis_df.merge(first_adt_dttm, on='hospitalization_id', how='left')
 
     # Compute time from admission to first organ failure
     organ_failure_cols = ['aki_dttm', 'vasopressor_dttm', 'hyperbilirubinemia_dttm',
@@ -677,9 +692,9 @@ def _(
         (analysis_df['discharge_dttm'] - analysis_df['admission_dttm']).dt.total_seconds() / 86400
     )
 
-    # Time to blood culture (hours from admission)
+    # Time to blood culture (hours from first ADT encounter time)
     analysis_df['time_to_bc_hours'] = (
-        (pd.to_datetime(analysis_df['blood_culture_dttm']) - analysis_df['admission_dttm']).dt.total_seconds() / 3600
+        (pd.to_datetime(analysis_df['blood_culture_dttm']) - analysis_df['first_adt_dttm']).dt.total_seconds() / 3600
     )
 
     # In-hospital death
@@ -964,7 +979,7 @@ def _(
     table1_rows.append({'Variable': '--- Race ---', **{nm: '' for nm in groups}})
     race_cats = analysis_df['race_category'].dropna().unique().tolist()
     table1_rows.extend([
-        {'Variable': f'{rc}, n (%)', **{nm: summarize_binary(df, df['race_category'] == rc) for nm, df in groups.items()}}
+        {'Variable': f'{rc}, n (%)', **{nm: summarize_binary(df, df['race_category'].str.lower() == rc.lower()) for nm, df in groups.items()}}
         for rc in race_cats
     ])
 
@@ -972,7 +987,7 @@ def _(
     table1_rows.append({'Variable': '--- Ethnicity ---', **{nm: '' for nm in groups}})
     eth_cats = analysis_df['ethnicity_category'].dropna().unique().tolist()
     table1_rows.extend([
-        {'Variable': f'{ec}, n (%)', **{nm: summarize_binary(df, df['ethnicity_category'] == ec) for nm, df in groups.items()}}
+        {'Variable': f'{ec}, n (%)', **{nm: summarize_binary(df, df['ethnicity_category'].str.lower() == ec.lower()) for nm, df in groups.items()}}
         for ec in eth_cats
     ])
 
@@ -1324,7 +1339,7 @@ def _(
     table1_rows.append(row)
 
     table1_rows.append({
-        'Variable': 'Time to blood culture (hours), median (IQR)',
+        'Variable': 'Time from 1st ADT to index BC (hours), median (IQR)',
         **{nm: summarize_median_iqr(df, 'time_to_bc_hours') for nm, df in groups.items()}
     })
 
@@ -1623,7 +1638,7 @@ def _(
         rws.append({'Variable': '--- Race ---', **{n: '' for n in grps}})
         race_cats = subset['race_category'].dropna().unique().tolist()
         rws.extend([
-            {'Variable': f'{rc}, n (%)', **{n: summarize_binary(g, g['race_category'] == rc) for n, g in grps.items()}}
+            {'Variable': f'{rc}, n (%)', **{n: summarize_binary(g, g['race_category'].str.lower() == rc.lower()) for n, g in grps.items()}}
             for rc in race_cats
         ])
 
@@ -1631,7 +1646,7 @@ def _(
         rws.append({'Variable': '--- Ethnicity ---', **{n: '' for n in grps}})
         eth_cats = subset['ethnicity_category'].dropna().unique().tolist()
         rws.extend([
-            {'Variable': f'{ec}, n (%)', **{n: summarize_binary(g, g['ethnicity_category'] == ec) for n, g in grps.items()}}
+            {'Variable': f'{ec}, n (%)', **{n: summarize_binary(g, g['ethnicity_category'].str.lower() == ec.lower()) for n, g in grps.items()}}
             for ec in eth_cats
         ])
 
@@ -1898,7 +1913,7 @@ def _(
         rws.append(row)
 
         rws.append({
-            'Variable': 'Time to blood culture (hours), median (IQR)',
+            'Variable': 'Time from 1st ADT to index BC (hours), median (IQR)',
             **{n: summarize_median_iqr(g, 'time_to_bc_hours') for n, g in grps.items()}
         })
 

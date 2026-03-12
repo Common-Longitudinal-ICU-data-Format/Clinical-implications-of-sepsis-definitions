@@ -901,7 +901,7 @@ def _(CLIF_DATA_DIR, FILETYPE, Labs, TIMEZONE, cohort_df, pd):
             'hospitalization_id': cohort_df['hospitalization_id'].tolist(),
             'lab_category': ['lactate']
         },
-        columns=['hospitalization_id', 'lab_result_dttm']
+        columns=['hospitalization_id', 'lab_result_dttm', 'lab_category']
     )
     lactate_df = lactate_labs.df.copy()
 

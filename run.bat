@@ -25,5 +25,8 @@ uv run python Code\02_table1.py || exit /b 1
 echo --- 03_ase_visualizations.py ---
 uv run python Code\03_ase_visualizations.py || exit /b 1
 
+echo --- 04_ase_site_analysis.qmd ---
+quarto render Code\04_ase_site_analysis.qmd || exit /b 1
+
 echo === Run finished: %date% %time% ===
 exit /b 0

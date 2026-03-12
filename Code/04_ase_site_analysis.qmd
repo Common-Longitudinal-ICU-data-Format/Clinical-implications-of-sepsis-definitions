@@ -1,0 +1,1041 @@
+---
+title: "ASE Definition Comparison: Site-Level Analysis"
+
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    toc-location: left
+    code-fold: true
+    code-summary: "Show code"
+    theme: cosmo
+    embed-resources: true
+    fig-width: 9
+    fig-height: 6
+execute:
+  warning: false
+  message: false
+  echo: true
+---
+
+# Overview
+
+This document implements the pre-specified analysis for the ASE Definition Comparison study. Sites should run this document from top to bottom without modification. All outputs are saved to the directory specified by `output_directory` in `clif_config.json` for return to the coordinating center.
+
+**Study Question:** Does hospital-level lactate ordering intensity explain the gap between core and extended CDC Adult Sepsis Event (ASE) rates?
+
+**Design:**
+
+- **Exposure:** Lactate ordering intensity (orders per 1,000 patient-days), hospital-year level
+- **Outcome:** ASE case status under core vs. extended definition (two rows per encounter)
+- **Method:** Logistic regression with clustered SEs at `hospitalization_id` level (sandwich estimator); hospital random intercept for multi-hospital sites
+- **Key term:** `defined_w_lactic × lactate_vol_scaled` interaction
+
+**Required data file:** `analysis_dataset.parquet` in the `phi_directory` specified in `clif_config.json`
+
+**Required variables:**
+
+| Variable | Description |
+|---|---|
+| `hospitalization_id` | Unique hospitalization identifier |
+| `hospital_id` | Facility identifier |
+| `defined_w_lactic` | 0 = core ASE definition, 1 = extended (includes lactate criterion) |
+| `ASE` | 1 = meets ASE criteria under this definition, 0 = does not |
+| `lactate_order_per_1000_patient_days` | Hospital-year lactate ordering intensity |
+| `worst_sofa_admission_to_24h` | SOFA score (0–24h from blood culture/antibiotic anchor) |
+| `age`, `sex`, `cci` | Patient demographics and comorbidity |
+| `hospital_type` | community or academic |
+| `year` | Calendar year |
+| `hospitalizations_from_ed_per_year` | Hospital-year ED volume |
+| `any_lactate_ordered` | 1 = any lactate ordered during hospitalization |
+
+---
+
+# Section 0 — Setup
+
+```{r setup}
+library(tidyverse)   # includes purrr
+library(lme4)        # glmer for multi-hospital sites
+library(sandwich)    # vcovCL clustered SEs
+library(lmtest)      # coeftest
+library(jsonlite)
+library(arrow)
+library(here)
+library(gtsummary)
+library(broom)
+library(scales)
+library(knitr)
+# library(splines)   # available if needed for nonlinear terms
+# library(tableone)  # optional: for descriptive tables
+
+set.seed(20240101)
+
+# ── Site configuration (from clif_config.json) ────────────────────────────────
+config     <- fromJSON(here("clif_config.json"))
+SITE_ID    <- config$site_name
+DATA_PATH  <- here(config$phi_directory, "analysis_dataset.parquet")
+OUTPUT_DIR <- here(config$output_directory)
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Active modeling approach - two paths only:
+#   >= 2 hospitals  ->  glmer with hospital RE (1 | hospital_id) + clustered SEs at encounter
+#   1 hospital      ->  glm + clustered SEs at encounter
+# Encounter-level pairing handled via clustered SEs throughout (not RE)
+
+# NOTE: MIN_HOSPITALS_FOR_NESTED_RE retained for reference only (not used in active analysis path)
+MIN_HOSPITALS_FOR_NESTED_RE <- 5
+
+# Create output directories
+dir.create(file.path(OUTPUT_DIR, "figures"),     showWarnings = FALSE, recursive = TRUE)
+dir.create(file.path(OUTPUT_DIR, "tables"),      showWarnings = FALSE, recursive = TRUE)
+dir.create(file.path(OUTPUT_DIR, "diagnostics"), showWarnings = FALSE, recursive = TRUE)
+dir.create(file.path(OUTPUT_DIR, "models"),      showWarnings = FALSE, recursive = TRUE)
+
+# Load data
+df_raw <- read_parquet(DATA_PATH)
+
+cat("Data loaded:", nrow(df_raw), "rows,", ncol(df_raw), "columns\n")
+cat("Unique hospitalizations:", n_distinct(df_raw$hospitalization_id), "\n")
+cat("Unique hospitals:", n_distinct(df_raw$hospital_id), "\n")
+```
+
+---
+
+# Section 1 — Data Quality Checks
+
+```{r data-quality}
+# 1.1 Overall structure
+cat("Rows:", nrow(df_raw), "\n")
+cat("Columns:", ncol(df_raw), "\n")
+cat("Unique hospitalizations:", n_distinct(df_raw$hospitalization_id), "\n")
+cat("Unique hospitals:", n_distinct(df_raw$hospital_id), "\n")
+
+# 1.2 Baseline completeness
+missing_summary <- df_raw %>%
+  summarise(across(everything(), ~ sum(is.na(.)))) %>%
+  pivot_longer(everything(), names_to = "variable", values_to = "n_missing") %>%
+  mutate(pct_missing = round(n_missing / nrow(df_raw) * 100, 1)) %>%
+  filter(n_missing > 0)
+
+cat("\nMissing data summary (variables with any missing):\n")
+print(missing_summary)
+
+baseline_completeness <- df_raw %>%
+  summarise(
+    n                     = n(),
+    age_miss              = sum(is.na(age)),
+    sex_miss              = sum(is.na(sex)),
+    cci_miss              = sum(is.na(cci)),
+    sofa_miss             = sum(is.na(worst_sofa_admission_to_24h)),
+    hosp_type_miss        = sum(is.na(hospital_type)),
+    lactate_vol_miss      = sum(is.na(lactate_order_per_1000_patient_days)),
+    year_miss             = sum(is.na(year)),
+    ASE_miss              = sum(is.na(ASE)),
+    defined_w_lactic_miss = sum(is.na(defined_w_lactic))
+  )
+
+cat("\nBaseline completeness:\n")
+kable(baseline_completeness, caption = "Baseline completeness — key analysis variables")
+write_csv(baseline_completeness,
+          file.path(OUTPUT_DIR, "diagnostics", "01_baseline_completeness.csv"))
+
+# 1.3 Data structure check
+cat("\nData structure:\n")
+str(df_raw)
+
+# 1.4 Confirm two-row structure per encounter (ASE + ASE w Lactic)
+row_counts <- df_raw %>%
+  count(hospitalization_id) %>%
+  count(n, name = "n_encounters")
+
+cat("\nRows per hospitalization_id (expect all = 2):\n")
+kable(row_counts, caption = "Expected: all hospitalizations should have exactly 2 rows")
+```
+
+---
+
+# Section 2 — Derived Variables
+
+```{r derived-variables}
+# 2.1 Patient group classification ─────────────────────────────────────────────
+# Pivot to wide (one row per encounter) to classify patient group:
+#   Core cases:          ASE == 1 on defined_w_lactic == 0 row
+#   Extended cases:      ASE == 0 on defined_w_lactic == 0 AND ASE == 1 on defined_w_lactic == 1
+#   No sepsis:           ASE == 0 on both rows
+#   check_data_quality:  ASE == 1 core, ASE == 0 extended — theoretically impossible
+
+df_groups <- df_raw %>%
+  select(hospitalization_id, defined_w_lactic, ASE) %>%
+  pivot_wider(
+    names_from   = defined_w_lactic,
+    values_from  = ASE,
+    names_prefix = "ASE_def_"
+  ) %>%
+  mutate(
+    patient_group = case_when(
+      ASE_def_0 == 1 & ASE_def_1 == 1  ~ "sepsis_core",
+      ASE_def_0 == 0 & ASE_def_1 == 1  ~ "sepsis_extended",
+      ASE_def_0 == 0 & ASE_def_1 == 0  ~ "no_sepsis",
+      ASE_def_0 == 1 & ASE_def_1 == 0  ~ "check_data_quality",
+      TRUE                              ~ NA_character_
+    )
+  )
+
+# Join group back onto long dataset
+df <- df_raw %>%
+  left_join(df_groups %>% select(hospitalization_id, patient_group),
+            by = "hospitalization_id")
+
+cat("Patient group distribution:\n")
+count(df_groups, patient_group) %>%
+  mutate(pct = round(n / sum(n) * 100, 1)) %>%
+  kable(caption = "Patient group distribution")
+
+# 2.2 Collinearity diagnostic: lactate volume vs year ──────────────────────────
+# Pearson r reported descriptively to justify primary modeling approach.
+# r > 0.7 = strong collinearity; SA3 (within-year centering) available as sensitivity check.
+# Note: computed at row level — repeated within hospital-year by design.
+
+cor_lactate_year <- cor(
+  df$lactate_order_per_1000_patient_days,
+  df$year,
+  use = "complete.obs"
+)
+cat(paste("\nPearson r (lactate_order_per_1000_patient_days ~ year):",
+          round(cor_lactate_year, 3), "\n"))
+if (abs(cor_lactate_year) > 0.7) {
+  warning("r > 0.7 — strong collinearity detected. Review SA3 (centered lactate) results carefully.")
+}
+
+# 2.3 Hospital count and modeling structure decision ────────────────────────────
+n_hospitals <- df %>% distinct(hospital_id) %>% nrow()
+cat(paste("Number of hospitals at this site:", n_hospitals, "\n"))
+
+# Two tiers only in active analysis:
+#   >= 2 hospitals  ->  glmer with hospital RE
+#   1 hospital      ->  glm with clustered SEs
+re_structure <- ifelse(n_hospitals >= 2, "hospital_re", "single_hospital")
+
+# Interaction type affects interpretation at aggregation stage:
+#   Between-hospital:        primary estimand — does the gap widen at higher-testing hospitals?
+#   Within-hospital temporal: secondary — do years with higher ordering show a wider gap?
+interaction_type <- ifelse(n_hospitals >= 2, "between_hospital", "within_hospital_temporal")
+
+cat(paste("Random effects structure:", re_structure, "\n"))
+cat(paste("Interaction type:", interaction_type, "\n"))
+
+# 2.4 Within-year centering (SA3 only) ─────────────────────────────────────────
+# Not used in primary model — retained for sensitivity analysis SA3.
+# Single-hospital sites: grand-mean centering used instead, flagged in output metadata.
+
+if (n_hospitals >= 2) {
+  hospital_year_stats <- df %>%
+    distinct(hospital_id, year, lactate_order_per_1000_patient_days) %>%
+    group_by(year) %>%
+    mutate(
+      lactate_volume_year_mean = mean(lactate_order_per_1000_patient_days, na.rm = TRUE),
+      lactate_volume_centered  = lactate_order_per_1000_patient_days - lactate_volume_year_mean
+    ) %>%
+    ungroup()
+  centering_method <- "within_year"
+} else {
+  hospital_year_stats <- df %>%
+    distinct(hospital_id, year, lactate_order_per_1000_patient_days) %>%
+    mutate(
+      lactate_volume_year_mean = mean(lactate_order_per_1000_patient_days, na.rm = TRUE),
+      lactate_volume_centered  = lactate_order_per_1000_patient_days - lactate_volume_year_mean
+    )
+  centering_method <- "grand_mean"
+  cat("Single-hospital site: grand-mean centering used for SA3. Flagged in output metadata.\n")
+}
+
+df <- df %>%
+  left_join(
+    hospital_year_stats %>% select(hospital_id, year, lactate_volume_centered,
+                                   lactate_volume_year_mean),
+    by = c("hospital_id", "year")
+  )
+
+cat(paste("Centering method:", centering_method, "\n"))
+
+# 2.5 Factor coding ─────────────────────────────────────────────────────────────
+df <- df %>%
+  mutate(
+    defined_w_lactic = factor(defined_w_lactic, levels = c(0, 1),
+                              labels = c("core", "extended")),
+    hospital_type    = factor(hospital_type, levels = c("community", "academic")),
+    sex              = factor(sex, levels = c("Male", "Female")),
+    year_f           = factor(year)
+  )
+```
+
+---
+
+# Section 3 — Descriptive Statistics
+
+```{r descriptives}
+# 3.1 Cohort summary ────────────────────────────────────────────────────────────
+cohort_summary <- df %>%
+  distinct(hospitalization_id, .keep_all = TRUE) %>%
+  summarise(
+    n_encounters       = n_distinct(hospitalization_id),
+    n_hospitals        = n_distinct(hospital_id),
+    n_years            = n_distinct(year),
+    year_range         = paste(min(year), max(year), sep = "-"),
+    median_age         = median(age, na.rm = TRUE),
+    pct_female         = round(mean(sex == "Female", na.rm = TRUE) * 100, 1),
+    median_cci         = median(cci, na.rm = TRUE),
+    pct_academic       = round(mean(hospital_type == "academic", na.rm = TRUE) * 100, 1)
+  )
+
+kable(cohort_summary, caption = "Overall cohort summary")
+
+# 3.2 ASE rate by definition and year ───────────────────────────────────────────
+ase_rate_by_year <- df %>%
+  group_by(year, defined_w_lactic) %>%
+  summarise(
+    n          = n(),
+    n_sepsis   = sum(ASE == 1, na.rm = TRUE),
+    pct_sepsis = round(mean(ASE == 1, na.rm = TRUE) * 100, 1),
+    .groups    = "drop"
+  )
+
+kable(ase_rate_by_year, caption = "ASE rate by year and definition")
+
+# 3.3 Hospital-year lactate volume summary ─────────────────────────────────────
+hosp_year_summary <- df %>%
+  distinct(hospital_id, year, lactate_order_per_1000_patient_days) %>%
+  group_by(year) %>%
+  summarise(
+    n_hospitals      = n(),
+    mean_lactate_vol = round(mean(lactate_order_per_1000_patient_days, na.rm = TRUE), 1),
+    sd_lactate_vol   = round(sd(lactate_order_per_1000_patient_days, na.rm = TRUE), 1),
+    min_lactate_vol  = round(min(lactate_order_per_1000_patient_days, na.rm = TRUE), 1),
+    max_lactate_vol  = round(max(lactate_order_per_1000_patient_days, na.rm = TRUE), 1),
+    .groups          = "drop"
+  )
+
+kable(hosp_year_summary, caption = "Hospital-year lactate volume summary")
+
+# 3.4 Patient group distribution ────────────────────────────────────────────────
+group_summary <- df_groups %>%
+  count(patient_group) %>%
+  mutate(pct = round(n / sum(n) * 100, 1))
+
+kable(group_summary, caption = "Patient group distribution")
+
+# 3.5 Clinical profile by patient group ────────────────────────────────────────
+# Restricted to sepsis cases only (core and extended)
+group_clinical <- df %>%
+  distinct(hospitalization_id, .keep_all = TRUE) %>%
+  filter(patient_group %in% c("sepsis_core", "sepsis_extended")) %>%
+  group_by(patient_group) %>%
+  summarise(
+    n              = n(),
+    median_age     = median(age, na.rm = TRUE),
+    pct_female     = round(mean(sex == "Female", na.rm = TRUE) * 100, 1),
+    median_cci     = median(cci, na.rm = TRUE),
+    median_sofa    = median(worst_sofa_admission_to_24h, na.rm = TRUE),
+    pct_academic   = round(mean(hospital_type == "academic", na.rm = TRUE) * 100, 1),
+    .groups        = "drop"
+  )
+
+kable(group_clinical, caption = "Clinical profile by patient group (sepsis cases only)")
+```
+
+```{r fig-lactate-trend, fig.height=5.5}
+# 3.6 Figure: Lactate ordering intensity over time ─────────────────────────────
+# Spaghetti (one line per hospital) + site mean overlay
+
+hosp_year_plot_data <- df %>%
+  distinct(hospital_id, year, lactate_order_per_1000_patient_days)
+
+site_mean_by_year <- hosp_year_plot_data %>%
+  group_by(year) %>%
+  summarise(site_mean = mean(lactate_order_per_1000_patient_days, na.rm = TRUE), .groups = "drop")
+
+ase_hosp_year <- df %>%
+  mutate(definition = ifelse(as.character(defined_w_lactic) %in% c("0", "core"),
+                             "core", "extended")) %>%
+  group_by(hospital_id, year, definition) %>%
+  summarise(ase_rate = mean(ASE == 1, na.rm = TRUE), .groups = "drop")
+
+lactate_range <- range(hosp_year_plot_data$lactate_order_per_1000_patient_days, na.rm = TRUE)
+scale_factor  <- diff(lactate_range)
+scale_offset  <- lactate_range[1]
+
+fig_lactate_trend <- ggplot() +
+  geom_line(data  = hosp_year_plot_data,
+            aes(x = year, y = lactate_order_per_1000_patient_days, group = hospital_id),
+            color = "steelblue", alpha = 0.45, linewidth = 0.6) +
+  geom_point(data  = hosp_year_plot_data,
+             aes(x = year, y = lactate_order_per_1000_patient_days, group = hospital_id),
+             color = "steelblue", alpha = 0.45, size = 1.2) +
+  geom_line(data  = site_mean_by_year,
+            aes(x = year, y = site_mean),
+            color = "steelblue", linewidth = 1.2) +
+  geom_point(data  = site_mean_by_year,
+             aes(x = year, y = site_mean),
+             color = "steelblue", size = 2.2) +
+  geom_line(data  = filter(ase_hosp_year, definition == "core"),
+            aes(x = year, y = ase_rate * scale_factor + scale_offset, group = hospital_id),
+            color = "firebrick", alpha = 0.45, linewidth = 0.6, linetype = "dashed") +
+  geom_line(data  = filter(ase_hosp_year, definition == "extended"),
+            aes(x = year, y = ase_rate * scale_factor + scale_offset, group = hospital_id),
+            color = "darkorange", alpha = 0.45, linewidth = 0.6, linetype = "dashed") +
+  scale_y_continuous(
+    name     = "Lactate Orders per 1,000 Patient-Days",
+    sec.axis = sec_axis(transform = ~ (. - scale_offset) / scale_factor,
+                        name      = "ASE Rate (proportion)")
+  ) +
+  scale_x_continuous(breaks = scales::pretty_breaks()) +
+  labs(title    = paste0("Lactate Ordering Intensity and ASE Rate Over Time (", SITE_ID, ")"),
+       subtitle = "Blue = lactate volume (solid = site mean); Red dashed = core ASE rate; Orange dashed = extended ASE rate",
+       x = "Year") +
+  theme_minimal(base_size = 13) +
+  theme(plot.title         = element_text(face = "bold"),
+        panel.grid.minor   = element_blank(),
+        axis.title.y.left  = element_text(color = "steelblue"),
+        axis.text.y.left   = element_text(color = "steelblue"),
+        axis.title.y.right = element_text(color = "firebrick"),
+        axis.text.y.right  = element_text(color = "firebrick"))
+
+ggsave(file.path(OUTPUT_DIR, "figures", paste0(SITE_ID, "_fig1_lactate_ase_trend.png")),
+       plot = fig_lactate_trend, width = 9, height = 5.5, dpi = 300)
+fig_lactate_trend
+```
+
+```{r fig-ase-gap}
+# 3.7 Figure: ASE rate gap over time ───────────────────────────────────────────
+# Gap = extended minus core ASE rate (percentage points)
+
+ase_gap_by_year <- ase_rate_by_year %>%
+  mutate(definition = ifelse(as.character(defined_w_lactic) %in% c("0", "core"),
+                             "core", "extended")) %>%
+  group_by(year, definition) %>%
+  summarise(pct_sepsis = mean(pct_sepsis, na.rm = TRUE), .groups = "drop") %>%
+  pivot_wider(id_cols = year, names_from = definition, values_from = pct_sepsis) %>%
+  mutate(gap = extended - core)
+
+ase_gap_by_hosp_year <- df %>%
+  group_by(hospital_id, year, defined_w_lactic) %>%
+  summarise(pct_sepsis = mean(ASE == 1, na.rm = TRUE) * 100, .groups = "drop") %>%
+  mutate(definition = ifelse(as.character(defined_w_lactic) %in% c("0", "core"),
+                             "core", "extended")) %>%
+  group_by(hospital_id, year, definition) %>%
+  summarise(pct_sepsis = mean(pct_sepsis, na.rm = TRUE), .groups = "drop") %>%
+  pivot_wider(id_cols = c(hospital_id, year),
+              names_from = definition, values_from = pct_sepsis) %>%
+  mutate(gap = extended - core)
+
+fig_ase_gap <- ggplot() +
+  { if (n_hospitals > 1)
+    geom_line(data  = ase_gap_by_hosp_year,
+              aes(x = year, y = gap, group = hospital_id),
+              color = "grey65", alpha = 0.5, linewidth = 0.6)
+  } +
+  geom_line(data  = ase_gap_by_year,
+            aes(x = year, y = gap),
+            color = "darkorchid", linewidth = 1.2) +
+  geom_point(data = ase_gap_by_year,
+             aes(x = year, y = gap),
+             color = "darkorchid", size = 2.2) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey40") +
+  scale_x_continuous(breaks = scales::pretty_breaks()) +
+  labs(title    = paste0("Extended vs Core ASE Rate Gap Over Time (", SITE_ID, ")"),
+       subtitle = "Gap = extended ASE rate minus core ASE rate (percentage points)\nGrey = individual hospitals; Purple = site mean",
+       x = "Year",
+       y = "ASE Rate Gap (percentage points)") +
+  theme_minimal(base_size = 13) +
+  theme(plot.title = element_text(face = "bold"), panel.grid.minor = element_blank())
+
+ggsave(file.path(OUTPUT_DIR, "figures", paste0(SITE_ID, "_fig2_ase_rate_gap.png")),
+       plot = fig_ase_gap, width = 8, height = 5, dpi = 300)
+fig_ase_gap
+```
+
+```{r fig-group-dist}
+# 3.8 Figure: Patient group distribution ───────────────────────────────────────
+
+fig_group_dist <- group_summary %>%
+  filter(patient_group != "check_data_quality") %>%
+  mutate(patient_group = factor(patient_group,
+                                levels = c("no_sepsis", "sepsis_core", "sepsis_extended"),
+                                labels = c("No Sepsis", "Core Sepsis", "Extended Only"))) %>%
+  ggplot(aes(x = patient_group, y = pct, fill = patient_group)) +
+  geom_col(width = 0.6, show.legend = FALSE) +
+  geom_text(aes(label = paste0(pct, "%\n(n=", scales::comma(n), ")")),
+            vjust = -0.4, size = 3.5) +
+  scale_fill_manual(values = c("No Sepsis"     = "grey75",
+                               "Core Sepsis"   = "firebrick",
+                               "Extended Only" = "darkorange")) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.12))) +
+  labs(title    = paste0("Patient Group Distribution (", SITE_ID, ")"),
+       subtitle = paste0("N = ", scales::comma(sum(group_summary$n[group_summary$patient_group != "check_data_quality"])),
+                         " unique encounters"),
+       x = NULL, y = "Percentage of Encounters (%)") +
+  theme_minimal(base_size = 13) +
+  theme(plot.title         = element_text(face = "bold"),
+        panel.grid.minor   = element_blank(),
+        panel.grid.major.x = element_blank())
+
+ggsave(file.path(OUTPUT_DIR, "figures", paste0(SITE_ID, "_fig3_patient_group_distribution.png")),
+       plot = fig_group_dist, width = 7, height = 5, dpi = 300)
+fig_group_dist
+```
+
+```{r fig-clinical-profile}
+# 3.9 Figure: Clinical profile comparison ─────────────────────────────────────
+# Only generated if both core and extended groups are present
+
+if (nrow(group_clinical) == 2) {
+  fig_clinical_profile <- group_clinical %>%
+    mutate(patient_group = factor(patient_group,
+                                  levels = c("sepsis_core", "sepsis_extended"),
+                                  labels = c("Core Sepsis", "Extended Only"))) %>%
+    select(patient_group, median_age, pct_female, median_cci, median_sofa) %>%
+    pivot_longer(cols = -patient_group, names_to = "variable", values_to = "value") %>%
+    mutate(variable = recode(variable,
+                             "median_age"  = "Median Age (years)",
+                             "pct_female"  = "Female (%)",
+                             "median_cci"  = "Median CCI",
+                             "median_sofa" = "Median SOFA (0-24h)")) %>%
+    ggplot(aes(x = value, y = variable, color = patient_group, shape = patient_group)) +
+    geom_point(size = 4) +
+    scale_color_manual(values = c("Core Sepsis"   = "firebrick",
+                                  "Extended Only" = "darkorange")) +
+    labs(title    = paste0("Clinical Profile: Core vs Extended-Only Sepsis (", SITE_ID, ")"),
+         subtitle = "Median values; Extended-only = meets ASE criteria via lactate only",
+         x = "Value", y = NULL, color = NULL, shape = NULL) +
+    facet_wrap(~ variable, scales = "free_x", ncol = 2) +
+    theme_minimal(base_size = 13) +
+    theme(plot.title      = element_text(face = "bold"),
+          panel.grid.minor = element_blank(),
+          legend.position  = "bottom",
+          strip.text       = element_text(face = "bold"))
+
+  ggsave(file.path(OUTPUT_DIR, "figures", paste0(SITE_ID, "_fig4_clinical_profile.png")),
+         plot = fig_clinical_profile, width = 8, height = 6, dpi = 300)
+  fig_clinical_profile
+
+} else {
+  cat("NOTE: Clinical profile figure skipped — one or both sepsis groups absent at this site.\n")
+  fig_clinical_profile <- NULL
+}
+```
+
+---
+
+# Section 4 — Primary Analysis
+
+Approach: `glm` (logistic) + clustered SEs at `hospitalization_id` level (sandwich estimator).
+
+- Encounter-level pairing (two rows per hospitalization) handled via clustered SEs rather than a random intercept
+- Hospital-level random intercept retained for multi-hospital sites via `glmer` with hospital RE only (no encounter RE)
+- Decision rationale: `glmer` with ~112k encounter-level RE levels is computationally intractable; clustered SEs produce equivalent inference for the within-encounter pairing  compared to encounter level RE 
+
+
+
+```{r primary-analysis}
+# 4.1 Prepare model dataset ─────────────────────────────────────────────────────
+df_model <- df %>%
+  mutate(
+    outcome            = as.integer(ASE == 1),
+    lactate_vol_scaled = scale(lactate_order_per_1000_patient_days)[, 1]
+  )
+
+lactate_center <- round(attr(scale(df$lactate_order_per_1000_patient_days), "scaled:center"), 2)
+lactate_scale  <- round(attr(scale(df$lactate_order_per_1000_patient_days), "scaled:scale"), 2)
+cat(paste("Lactate volume scaling: mean =", lactate_center, "| SD =", lactate_scale, "\n"))
+
+# 4.2 Zero-variance covariate check ─────────────────────────────────────────────
+zero_var_covariates <- c("worst_sofa_admission_to_24h", "age", "sex", "cci",
+                         "hospital_type", "year", "hospitalizations_from_ed_per_year") %>%
+  purrr::keep(~ {
+    col <- df_model[[.x]]
+    if (is.factor(col)) nlevels(droplevels(col)) < 2
+    else length(unique(col[!is.na(col)])) < 2
+  })
+
+if (length(zero_var_covariates) > 0) {
+  warning("Zero-variance covariates dropped: ", paste(zero_var_covariates, collapse = ", "))
+} else {
+  cat("No zero-variance covariates detected.\n")
+}
+
+covariate_terms <- setdiff(
+  c("worst_sofa_admission_to_24h", "age", "sex", "cci",
+    "hospital_type", "year", "hospitalizations_from_ed_per_year"),
+  zero_var_covariates
+)
+
+# 4.3 Fit primary model ──────────────────────────────────────────────────────────
+formula_primary <- reformulate(
+  termlabels = c(
+    "defined_w_lactic * lactate_vol_scaled",
+    covariate_terms,
+    if (re_structure != "single_hospital") "(1 | hospital_id)" else NULL
+  ),
+  response = "outcome"
+)
+
+primary_warning <- NULL
+
+if (re_structure == "single_hospital") {
+  model_type    <- "single_hospital_glm_clustered_se"
+  model_primary <- tryCatch(
+    glm(formula_primary, data = df_model, family = binomial),
+    error = function(e) { warning("Primary model ERROR: ", e$message); NULL }
+  )
+} else {
+  model_type    <- "hospital_re_glmer_clustered_se"
+  model_primary <- withCallingHandlers(
+    tryCatch(
+      glmer(formula_primary, data = df_model, family = binomial,
+            control = glmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 2e5))),
+      error = function(e) { warning("Primary model ERROR: ", e$message); NULL }
+    ),
+    warning = function(w) {
+      primary_warning <<- w$message
+      message("Primary model WARNING: ", w$message)
+      invokeRestart("muffleWarning")
+    }
+  )
+}
+
+if (!is.null(model_primary)) {
+  vcov_matrix <- vcovCL(model_primary, cluster = df_model$hospitalization_id)
+  coef_robust <- coeftest(model_primary, vcov = vcov_matrix)
+  cat("Primary model fitted successfully.\n")
+} else {
+  vcov_matrix <- NULL
+  coef_robust <- NULL
+  warning("Primary model failed to fit.")
+}
+
+# 4.4 Extract model output ───────────────────────────────────────────────────────
+# Helper: safely tidy a coeftest object into a clean data frame.
+# Uses broom::tidy() which correctly handles the named coeftest matrix
+# regardless of column name formatting (avoids x.estimate / dimnames issues).
+tidy_coeftest <- function(ct) {
+  broom::tidy(ct) %>%
+    rename(std.error = std.error, statistic = statistic, p.value = p.value)
+}
+
+if (!is.null(model_primary)) {
+  coef_table <- tidy_coeftest(coef_robust) %>%
+    mutate(
+      conf.low            = estimate - 1.96 * std.error,
+      conf.high           = estimate + 1.96 * std.error,
+      site_id             = SITE_ID,
+      model_version       = model_type,
+      interaction_type    = interaction_type,
+      n_hospitals         = n_hospitals,
+      centering_method    = centering_method,
+      lactate_mean        = lactate_center,
+      lactate_sd          = lactate_scale,
+      dropped_covariates  = paste(zero_var_covariates, collapse = ", "),
+      convergence_warning = !is.null(primary_warning)
+    )
+
+  cat("Primary model coefficients (clustered SEs):\n")
+  kable(coef_table, digits = 4, caption = "Primary model — all coefficients (log-OR scale)")
+
+} else {
+  warning("Primary model failed to fit. coef_table and vcov_matrix set to NULL.")
+  coef_table  <- NULL
+  vcov_matrix <- NULL
+}
+```
+
+---
+
+# Section 5 — Sensitivity Analyses
+
+```{r sensitivity-sa1}
+# SA1: Restrict to encounters with any lactate ordered ─────────────────────────
+cat("Fitting SA1: primary model restricted to encounters with lactate ordered\n")
+
+df_sa1 <- df_model %>% filter(any_lactate_ordered == 1)
+cat(paste("SA1 sample: n =", nrow(df_sa1), "rows (",
+          n_distinct(df_sa1$hospitalization_id), "encounters)\n"))
+
+if (re_structure == "single_hospital") {
+  model_sa1 <- tryCatch(
+    glm(formula_primary, data = df_sa1, family = binomial),
+    error = function(e) { warning("SA1 ERROR: ", e$message); NULL }
+  )
+} else {
+  sa1_warning <- NULL
+  model_sa1 <- withCallingHandlers(
+    tryCatch(
+      glmer(formula_primary, data = df_sa1, family = binomial,
+            control = glmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 2e5))),
+      error = function(e) { warning("SA1 ERROR: ", e$message); NULL }
+    ),
+    warning = function(w) {
+      sa1_warning <<- w$message
+      message("SA1 WARNING: ", w$message)
+      invokeRestart("muffleWarning")
+    }
+  )
+}
+
+if (!is.null(model_sa1)) {
+  vcov_sa1     <- vcovCL(model_sa1, cluster = df_sa1$hospitalization_id)
+  coef_sa1_raw <- coeftest(model_sa1, vcov = vcov_sa1)
+  coef_sa1 <- tidy_coeftest(coef_sa1_raw) %>%
+    mutate(conf.low      = estimate - 1.96 * std.error,
+           conf.high     = estimate + 1.96 * std.error,
+           site_id       = SITE_ID,
+           model_version = "sa1_lactate_ordered_only",
+           n_rows        = nrow(df_sa1))
+  cat("SA1 complete.\n")
+  coef_sa1 %>% filter(grepl("defined_w_lactic", term)) %>%
+    kable(digits = 4, caption = "SA1 — key terms (log-OR scale)")
+} else {
+  coef_sa1 <- NULL
+  warning("SA1 failed to fit.")
+}
+```
+
+```{r sensitivity-sa2a}
+# SA2a: Exclude COVID years (2020–2021) ────────────────────────────────────────
+cat("Fitting SA2a: primary model excluding COVID years (2020-2021)\n")
+
+df_sa2a <- df_model %>% filter(!year %in% c(2020, 2021))
+cat(paste("SA2a sample: n =", nrow(df_sa2a), "rows (",
+          n_distinct(df_sa2a$hospitalization_id), "encounters); years excluded: 2020, 2021\n"))
+
+if (nrow(df_sa2a) == 0) {
+  cat("SA2a: No data outside 2020-2021 at this site — skipping.\n")
+  coef_sa2a <- NULL
+} else {
+  if (re_structure == "single_hospital") {
+    model_sa2a <- tryCatch(
+      glm(formula_primary, data = df_sa2a, family = binomial),
+      error = function(e) { warning("SA2a ERROR: ", e$message); NULL }
+    )
+  } else {
+    sa2a_warning <- NULL
+    model_sa2a <- withCallingHandlers(
+      tryCatch(
+        glmer(formula_primary, data = df_sa2a, family = binomial,
+              control = glmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 2e5))),
+        error = function(e) { warning("SA2a ERROR: ", e$message); NULL }
+      ),
+      warning = function(w) {
+        sa2a_warning <<- w$message
+        message("SA2a WARNING: ", w$message)
+        invokeRestart("muffleWarning")
+      }
+    )
+  }
+  if (!is.null(model_sa2a)) {
+    vcov_sa2a     <- vcovCL(model_sa2a, cluster = df_sa2a$hospitalization_id)
+    coef_sa2a_raw <- coeftest(model_sa2a, vcov = vcov_sa2a)
+    coef_sa2a <- tidy_coeftest(coef_sa2a_raw) %>%
+      mutate(conf.low       = estimate - 1.96 * std.error,
+             conf.high      = estimate + 1.96 * std.error,
+             site_id        = SITE_ID,
+             model_version  = "sa2a_exclude_covid_2020_2021",
+             years_excluded = "2020, 2021",
+             n_rows         = nrow(df_sa2a))
+    cat("SA2a complete.\n")
+    coef_sa2a %>% filter(grepl("defined_w_lactic", term)) %>%
+      kable(digits = 4, caption = "SA2a — key terms (log-OR scale)")
+  } else {
+    coef_sa2a <- NULL
+    warning("SA2a failed to fit.")
+  }
+}
+```
+
+```{r sensitivity-sa2b}
+# SA2b: Year-by-year stratification (exploratory) ──────────────────────────────
+cat("Fitting SA2b: year-by-year stratified models\n")
+
+years_available <- sort(unique(df_model$year))
+cat(paste("SA2b: fitting models for years:", paste(years_available, collapse = ", "), "\n"))
+
+coef_sa2b_list <- map(years_available, function(yr) {
+  d <- filter(df_model, year == yr)
+  cat(paste("SA2b - year", yr, ": n =", nrow(d), "rows\n"))
+
+  yr_zero_var <- c("hospital_type", "sex", "year") %>%
+    purrr::keep(~ {
+      col <- d[[.x]]
+      if (is.factor(col)) nlevels(droplevels(col)) < 2
+      else length(unique(col[!is.na(col)])) < 2
+    })
+
+  yr_covariates <- setdiff(covariate_terms, c(yr_zero_var, "year"))
+  yr_formula    <- reformulate(
+    termlabels = c("defined_w_lactic * lactate_vol_scaled", yr_covariates,
+                   if (re_structure != "single_hospital") "(1 | hospital_id)" else NULL),
+    response = "outcome"
+  )
+
+  yr_warning <- NULL
+  fit <- if (re_structure == "single_hospital") {
+    tryCatch(
+      glm(yr_formula, data = d, family = binomial),
+      error = function(e) { warning("SA2b year ", yr, " ERROR: ", e$message); NULL }
+    )
+  } else {
+    withCallingHandlers(
+      tryCatch(
+        glmer(yr_formula, data = d, family = binomial,
+              control = glmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 2e5))),
+        error = function(e) { warning("SA2b year ", yr, " ERROR: ", e$message); NULL }
+      ),
+      warning = function(w) {
+        yr_warning <<- w$message
+        message("SA2b year ", yr, " WARNING: ", w$message)
+        invokeRestart("muffleWarning")
+      }
+    )
+  }
+
+  if (is.null(fit)) return(NULL)
+
+  vcov_yr     <- vcovCL(fit, cluster = d$hospitalization_id)
+  coef_yr_raw <- coeftest(fit, vcov = vcov_yr)
+  tidy_coeftest(coef_yr_raw) %>%
+    mutate(conf.low            = estimate - 1.96 * std.error,
+           conf.high           = estimate + 1.96 * std.error,
+           site_id             = SITE_ID,
+           model_version       = "sa2b_year_stratified",
+           year                = yr,
+           n_rows              = nrow(d),
+           convergence_warning = !is.null(yr_warning))
+})
+
+coef_sa2b <- bind_rows(coef_sa2b_list)
+cat(paste("SA2b complete:", length(coef_sa2b_list), "year-specific models attempted.\n"))
+coef_sa2b %>% filter(grepl("defined_w_lactic", term)) %>%
+  kable(digits = 4, caption = "SA2b — key terms by year (log-OR scale)")
+```
+
+```{r sensitivity-sa3}
+# SA3: Within-year centered lactate volume ─────────────────────────────────────
+cat("Fitting SA3: within-year centered lactate volume\n")
+
+df_sa3 <- df_model
+formula_sa3 <- reformulate(
+  termlabels = c("defined_w_lactic * lactate_volume_centered",
+                 setdiff(covariate_terms, "year"),
+                 if (re_structure != "single_hospital") "(1 | hospital_id)" else NULL),
+  response = "outcome"
+)
+
+sa3_warning <- NULL
+model_sa3 <- withCallingHandlers(
+  tryCatch(
+    if (re_structure == "single_hospital")
+      glm(formula_sa3, data = df_sa3, family = binomial)
+    else
+      glmer(formula_sa3, data = df_sa3, family = binomial,
+            control = glmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 2e5))),
+    error = function(e) { warning("SA3 ERROR: ", e$message); NULL }
+  ),
+  warning = function(w) {
+    sa3_warning <<- w$message
+    message("SA3 WARNING: ", w$message)
+    invokeRestart("muffleWarning")
+  }
+)
+
+if (!is.null(model_sa3)) {
+  vcov_sa3     <- vcovCL(model_sa3, cluster = df_sa3$hospitalization_id)
+  coef_sa3_raw <- coeftest(model_sa3, vcov = vcov_sa3)
+  coef_sa3 <- tidy_coeftest(coef_sa3_raw) %>%
+    mutate(conf.low         = estimate - 1.96 * std.error,
+           conf.high        = estimate + 1.96 * std.error,
+           site_id          = SITE_ID,
+           model_version    = "sa3_centered_lactate",
+           centering_method = centering_method)
+  cat("SA3 complete.\n")
+  coef_sa3 %>% filter(grepl("defined_w_lactic", term)) %>%
+    kable(digits = 4, caption = "SA3 — key terms (log-OR scale)")
+} else {
+  coef_sa3 <- NULL
+  warning("SA3 failed to fit.")
+}
+```
+
+```{r sensitivity-sa4}
+# SA4: Hospital fixed effects (skipped at single-hospital sites) ───────────────
+cat("Fitting SA4: hospital fixed effects + clustered SEs\n")
+
+if (n_hospitals == 1) {
+  cat("SA4 skipped: hospital fixed effects not estimable with a single hospital.\n")
+  coef_sa4 <- NULL
+} else {
+  formula_sa4 <- reformulate(
+    termlabels = c("defined_w_lactic * lactate_vol_scaled", covariate_terms, "hospital_id"),
+    response   = "outcome"
+  )
+  model_sa4 <- tryCatch(
+    glm(formula_sa4, data = df_model, family = binomial),
+    error = function(e) { warning("SA4 ERROR: ", e$message); NULL }
+  )
+  if (!is.null(model_sa4)) {
+    vcov_sa4     <- vcovCL(model_sa4, cluster = df_model$hospitalization_id)
+    coef_sa4_raw <- coeftest(model_sa4, vcov = vcov_sa4)
+    coef_sa4 <- tidy_coeftest(coef_sa4_raw) %>%
+      mutate(conf.low      = estimate - 1.96 * std.error,
+             conf.high     = estimate + 1.96 * std.error,
+             site_id       = SITE_ID,
+             model_version = "sa4_fixed_effects_hospital_clustered_se")
+    cat("SA4 complete.\n")
+    coef_sa4 %>% filter(grepl("defined_w_lactic", term)) %>%
+      kable(digits = 4, caption = "SA4 — key terms (log-OR scale)")
+  } else {
+    coef_sa4 <- NULL
+    warning("SA4 failed to fit.")
+  }
+}
+```
+
+---
+
+# Section 6 — Output Assembly & Export
+
+```{r export-compile}
+# 6.1 Compile output list ───────────────────────────────────────────────────────
+output_list <- list(
+  # Site metadata
+  site_id              = SITE_ID,
+  model_version_used   = re_structure,
+  interaction_type     = interaction_type,
+  n_hospitals          = n_hospitals,
+  cor_lactate_year     = cor_lactate_year,
+  dropped_covariates   = zero_var_covariates,
+  lactate_mean         = lactate_center,
+  lactate_sd           = lactate_scale,
+  # Primary model
+  coef_primary         = coef_table,
+  vcov_primary         = vcov_matrix,
+  # Descriptive tables
+  cohort_summary       = cohort_summary,
+  ase_rate_by_year     = ase_rate_by_year,
+  hosp_year_summary    = hosp_year_summary,
+  group_summary        = group_summary,
+  group_clinical       = group_clinical,
+  # Sensitivity analyses
+  coef_sa1             = coef_sa1,
+  coef_sa2a            = coef_sa2a,
+  coef_sa2b            = coef_sa2b,
+  coef_sa3             = coef_sa3,
+  coef_sa4             = coef_sa4,
+  # Figures
+  fig_lactate_trend    = fig_lactate_trend,
+  fig_ase_gap          = fig_ase_gap,
+  fig_group_dist       = fig_group_dist,
+  fig_clinical_profile = fig_clinical_profile
+)
+
+# 6.2 Export CSVs ───────────────────────────────────────────────────────────────
+write_csv(baseline_completeness,
+          file.path(OUTPUT_DIR, "diagnostics", paste0(SITE_ID, "_01_baseline_completeness.csv")))
+write_csv(
+  tibble(site_id = SITE_ID, cor_lactate_year = cor_lactate_year,
+         collinearity_flag = abs(cor_lactate_year) > 0.7),
+  file.path(OUTPUT_DIR, "diagnostics", paste0(SITE_ID, "_02_cor_lactate_year.csv")))
+
+write_csv(cohort_summary,
+          file.path(OUTPUT_DIR, "tables", paste0(SITE_ID, "_01_cohort_summary.csv")))
+write_csv(ase_rate_by_year,
+          file.path(OUTPUT_DIR, "tables", paste0(SITE_ID, "_02_ase_rate_by_year.csv")))
+write_csv(hosp_year_summary,
+          file.path(OUTPUT_DIR, "tables", paste0(SITE_ID, "_03_hosp_year_lactate_summary.csv")))
+write_csv(group_summary,
+          file.path(OUTPUT_DIR, "tables", paste0(SITE_ID, "_04_patient_group_distribution.csv")))
+write_csv(group_clinical,
+          file.path(OUTPUT_DIR, "tables", paste0(SITE_ID, "_05_clinical_profile_by_group.csv")))
+
+if (!is.null(coef_table))  write_csv(coef_table,
+  file.path(OUTPUT_DIR, "models", paste0(SITE_ID, "_06_primary_model_coefs.csv")))
+if (!is.null(vcov_matrix)) write_csv(as.data.frame(vcov_matrix),
+  file.path(OUTPUT_DIR, "models", paste0(SITE_ID, "_07_primary_vcov_clustered.csv")))
+
+if (!is.null(coef_sa1))  write_csv(coef_sa1,
+  file.path(OUTPUT_DIR, "models", paste0(SITE_ID, "_08_sa1_lactate_ordered_coefs.csv")))
+if (!is.null(coef_sa2a)) write_csv(coef_sa2a,
+  file.path(OUTPUT_DIR, "models", paste0(SITE_ID, "_09_sa2a_exclude_covid_coefs.csv")))
+if (!is.null(coef_sa2b) && nrow(coef_sa2b) > 0) write_csv(coef_sa2b,
+  file.path(OUTPUT_DIR, "models", paste0(SITE_ID, "_10_sa2b_year_stratified_coefs.csv")))
+if (!is.null(coef_sa3))  write_csv(coef_sa3,
+  file.path(OUTPUT_DIR, "models", paste0(SITE_ID, "_11_sa3_centered_lactate_coefs.csv")))
+if (!is.null(coef_sa4))  write_csv(coef_sa4,
+  file.path(OUTPUT_DIR, "models", paste0(SITE_ID, "_12_sa4_hospital_fixed_effects_coefs.csv")))
+
+cat("CSV exports complete.\n")
+
+# 6.3 Save RDS + JSON bundle ────────────────────────────────────────────────────
+saveRDS(output_list,
+        file = file.path(OUTPUT_DIR, "models", paste0(SITE_ID, "_ASE_results.rds")))
+
+output_json <- output_list
+# Strip ggplot objects — not JSON-serializable; use PNG exports instead
+output_json[c("fig_lactate_trend", "fig_ase_gap",
+              "fig_group_dist", "fig_clinical_profile")] <- NULL
+output_json$vcov_primary <- if (!is.null(vcov_matrix)) as.data.frame(vcov_matrix) else NULL
+
+write_json(output_json,
+           path   = file.path(OUTPUT_DIR, "models", paste0(SITE_ID, "_ASE_results.json")),
+           pretty = TRUE, auto_unbox = TRUE, na = "null")
+
+cat("RDS and JSON exports complete.\n")
+cat(paste0("All outputs saved to ", OUTPUT_DIR, " — share entire folder with coordinating center.\n"))
+```
+
+---
+
+# Session Info
+
+```{r session-info}
+writeLines(capture.output(sessionInfo()),
+           file.path(OUTPUT_DIR, "diagnostics", paste0(SITE_ID, "_session_info.txt")))
+sessionInfo()
+```
+
+---
+
+# Output File Summary
+
+The following files have been saved to the `<output_directory>/` directory (as configured in `clif_config.json`) for return to the coordinating center.
+
+**Diagnostics (return all):**
+
+- `<output_directory>/diagnostics/[SITE]_01_baseline_completeness.csv`
+- `<output_directory>/diagnostics/[SITE]_02_cor_lactate_year.csv`
+- `<output_directory>/diagnostics/[SITE]_session_info.txt`
+
+**Tables (return all):**
+
+- `<output_directory>/tables/[SITE]_01_cohort_summary.csv`
+- `<output_directory>/tables/[SITE]_02_ase_rate_by_year.csv`
+- `<output_directory>/tables/[SITE]_03_hosp_year_lactate_summary.csv`
+- `<output_directory>/tables/[SITE]_04_patient_group_distribution.csv`
+- `<output_directory>/tables/[SITE]_05_clinical_profile_by_group.csv`
+
+**Models (return all):**
+
+- `<output_directory>/models/[SITE]_06_primary_model_coefs.csv` — **primary result**
+- `<output_directory>/models/[SITE]_07_primary_vcov_clustered.csv`
+- `<output_directory>/models/[SITE]_08_sa1_lactate_ordered_coefs.csv`
+- `<output_directory>/models/[SITE]_09_sa2a_exclude_covid_coefs.csv`
+- `<output_directory>/models/[SITE]_10_sa2b_year_stratified_coefs.csv`
+- `<output_directory>/models/[SITE]_11_sa3_centered_lactate_coefs.csv`
+- `<output_directory>/models/[SITE]_12_sa4_hospital_fixed_effects_coefs.csv`
+- `<output_directory>/models/[SITE]_ASE_results.rds` — full output bundle
+- `<output_directory>/models/[SITE]_ASE_results.json`
+
+**Figures (return if flagged issues):**
+
+- `<output_directory>/figures/[SITE]_fig1_lactate_ase_trend.png`
+- `<output_directory>/figures/[SITE]_fig2_ase_rate_gap.png`
+- `<output_directory>/figures/[SITE]_fig3_patient_group_distribution.png`
+- `<output_directory>/figures/[SITE]_fig4_clinical_profile.png`

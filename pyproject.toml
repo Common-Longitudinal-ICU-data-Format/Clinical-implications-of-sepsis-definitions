@@ -2,18 +2,10 @@
 name = "clinical-implications-of-sepsis-definitions"
 version = "0.1.0"
 description = "Add your description here"
-requires-python = ">=3.13"
+readme = "README.md"
+requires-python = ">=3.13, <3.14"
 dependencies = [
-    "clifpy",
-    "duckdb>=1.4.3",
-    "marimo>=0.18.4",
-    "numpy>=2.4.0",
-    "pandas>=2.3.3",
-    "plotly>=6.0.0",
-    "polars>=1.38.1",
-    "pyarrow>=22.0.0",
-    "upsetplot>=0.9.0",
+    "clifpy>=0.4.0",
+    "marimo>=0.20.4",
+    "plotly>=6.6.0",
 ]
-
-[tool.uv.sources]
-clifpy = { path = "clifpy", editable = true }

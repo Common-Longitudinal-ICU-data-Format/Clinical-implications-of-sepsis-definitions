@@ -169,7 +169,7 @@ def _(cohort_df):
 def _(cohort_df_filtered):
     # Filter 3: Admitted via ED
     cohort_df_ed = cohort_df_filtered[
-        cohort_df_filtered["admission_type_category"] == "ed"
+        cohort_df_filtered["admission_type_category"].str.lower() == "ed"
     ].copy()
 
     print(f"After ED admission filter: {cohort_df_ed['hospitalization_id'].nunique():,} hospitalizations")
@@ -190,7 +190,7 @@ def _(cohort_df_ed):
 @app.cell
 def _(adt, cohort_df_hospital):
     # Filter 5: Must have ED location during hospitalization
-    hosp_with_ed = set(adt.df[adt.df["location_category"] == "ed"]["hospitalization_id"].unique())
+    hosp_with_ed = set(adt.df[adt.df["location_category"].str.lower() == "ed"]["hospitalization_id"].unique())
 
     cohort_df_final = cohort_df_hospital[
         cohort_df_hospital["hospitalization_id"].isin(hosp_with_ed)
@@ -223,17 +223,17 @@ def _(cohort_df_final, patient, pd):
 
     # Create combined race/ethnicity column
     def get_race_ethnicity(row):
-        race = row["race_category"]
-        eth = row["ethnicity_category"]
-        if race == "Asian":
+        race = row["race_category"].lower() if isinstance(row["race_category"], str) else row["race_category"]
+        eth = row["ethnicity_category"].lower() if isinstance(row["ethnicity_category"], str) else row["ethnicity_category"]
+        if race == "asian":
             return "Asian"
-        elif eth == "Hispanic" and race == "Black or African American":
+        elif eth == "hispanic" and race == "black or african american":
             return "Hispanic Black"
-        elif eth == "Hispanic" and race == "White":
+        elif eth == "hispanic" and race == "white":
             return "Hispanic White"
-        elif eth == "Non-Hispanic" and race == "Black or African American":
+        elif eth == "non-hispanic" and race == "black or african american":
             return "Non-Hispanic Black"
-        elif eth == "Non-Hispanic" and race == "White":
+        elif eth == "non-hispanic" and race == "white":
             return "Non-Hispanic White"
         else:
             return "Other"
