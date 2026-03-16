@@ -164,7 +164,11 @@ Protected intermediate files (`cohort_df.parquet`, `ase_results.parquet`, `analy
 
 ### 1. Configure `clif_config.json`
 
-Copy the template and fill in site-specific paths:
+Rename the template file and fill in site-specific paths:
+
+``` bash
+cp clif_config_template.json clif_config.json
+```
 
 ``` json
 {
@@ -184,16 +188,25 @@ Copy the template and fill in site-specific paths:
 
 ### 2. Set up environment
 
-This project uses [uv](https://docs.astral.sh/uv/) for Python dependency management. R and Quarto are required for script 04.
+This is a **hybrid Python + R** pipeline:
+
+- **Steps 1–3** are Python, managed by [uv](https://docs.astral.sh/uv/)
+- **Step 4** is R/Quarto — requires [R](https://cran.r-project.org/) and [Quarto](https://quarto.org/) to be installed separately (YMMV)
 
 ``` bash
 uv sync
 ```
 
+> **Note:** If the Quarto step fails, you can open `Code/04_ase_site_analysis.qmd` in RStudio and render it directly from there.
+
 ### 3. Run the pipeline
 
 ``` bash
+# macOS / Linux
 bash run.sh
+
+# Windows
+run.bat
 ```
 
 This executes all scripts sequentially and logs output to `logs/`.
