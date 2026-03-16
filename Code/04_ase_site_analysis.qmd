@@ -57,6 +57,7 @@ This document implements the pre-specified analysis for the ASE Definition Compa
 library(tidyverse)   # includes purrr
 library(lme4)        # glmer for multi-hospital sites
 library(sandwich)    # vcovCL clustered SEs
+library(clubSandwich)  # vcovCR clustered SEs (glmer path — sandwich lacks estfun for merMod)
 library(lmtest)      # coeftest
 library(jsonlite)
 library(arrow)
@@ -538,19 +539,23 @@ Approach: `glm` (logistic) + clustered SEs at `hospitalization_id` level (sandwi
 
 ```{r primary-analysis}
 # 4.1 Prepare model dataset ─────────────────────────────────────────────────────
+year_center <- round(mean(df$year, na.rm = TRUE), 2)
+
 df_model <- df %>%
   mutate(
     outcome            = as.integer(ASE == 1),
-    lactate_vol_scaled = scale(lactate_order_per_1000_patient_days)[, 1]
+    lactate_vol_scaled = scale(lactate_order_per_1000_patient_days)[, 1],
+    year_centered      = year - year_center
   )
 
 lactate_center <- round(attr(scale(df$lactate_order_per_1000_patient_days), "scaled:center"), 2)
 lactate_scale  <- round(attr(scale(df$lactate_order_per_1000_patient_days), "scaled:scale"), 2)
 cat(paste("Lactate volume scaling: mean =", lactate_center, "| SD =", lactate_scale, "\n"))
+cat(paste("Year centering offset:", year_center, "\n"))
 
 # 4.2 Zero-variance covariate check ─────────────────────────────────────────────
 zero_var_covariates <- c("worst_sofa_admission_to_24h", "age", "sex", "cci",
-                         "hospital_type", "year", "hospitalizations_from_ed_per_year") %>%
+                         "hospital_type", "year_centered", "hospitalizations_from_ed_per_year") %>%
   purrr::keep(~ {
     col <- df_model[[.x]]
     if (is.factor(col)) nlevels(droplevels(col)) < 2
@@ -565,7 +570,7 @@ if (length(zero_var_covariates) > 0) {
 
 covariate_terms <- setdiff(
   c("worst_sofa_admission_to_24h", "age", "sex", "cci",
-    "hospital_type", "year", "hospitalizations_from_ed_per_year"),
+    "hospital_type", "year_centered", "hospitalizations_from_ed_per_year"),
   zero_var_covariates
 )
 
@@ -603,8 +608,16 @@ if (re_structure == "single_hospital") {
   )
 }
 
+robust_vcov <- function(model, cluster) {
+  if (inherits(model, "glmerMod")) {
+    clubSandwich::vcovCR(model, cluster = cluster, type = "CR0")
+  } else {
+    sandwich::vcovCL(model, cluster = cluster)
+  }
+}
+
 if (!is.null(model_primary)) {
-  vcov_matrix <- vcovCL(model_primary, cluster = df_model$hospitalization_id)
+  vcov_matrix <- robust_vcov(model_primary, cluster = df_model$hospitalization_id)
   coef_robust <- coeftest(model_primary, vcov = vcov_matrix)
   cat("Primary model fitted successfully.\n")
 } else {
@@ -634,6 +647,7 @@ if (!is.null(model_primary)) {
       centering_method    = centering_method,
       lactate_mean        = lactate_center,
       lactate_sd          = lactate_scale,
+      year_center         = year_center,
       dropped_covariates  = paste(zero_var_covariates, collapse = ", "),
       convergence_warning = !is.null(primary_warning)
     )
@@ -682,7 +696,7 @@ if (re_structure == "single_hospital") {
 }
 
 if (!is.null(model_sa1)) {
-  vcov_sa1     <- vcovCL(model_sa1, cluster = df_sa1$hospitalization_id)
+  vcov_sa1     <- robust_vcov(model_sa1, cluster = df_sa1$hospitalization_id)
   coef_sa1_raw <- coeftest(model_sa1, vcov = vcov_sa1)
   coef_sa1 <- tidy_coeftest(coef_sa1_raw) %>%
     mutate(conf.low      = estimate - 1.96 * std.error,
@@ -732,7 +746,7 @@ if (nrow(df_sa2a) == 0) {
     )
   }
   if (!is.null(model_sa2a)) {
-    vcov_sa2a     <- vcovCL(model_sa2a, cluster = df_sa2a$hospitalization_id)
+    vcov_sa2a     <- robust_vcov(model_sa2a, cluster = df_sa2a$hospitalization_id)
     coef_sa2a_raw <- coeftest(model_sa2a, vcov = vcov_sa2a)
     coef_sa2a <- tidy_coeftest(coef_sa2a_raw) %>%
       mutate(conf.low       = estimate - 1.96 * std.error,
@@ -762,14 +776,14 @@ coef_sa2b_list <- map(years_available, function(yr) {
   d <- filter(df_model, year == yr)
   cat(paste("SA2b - year", yr, ": n =", nrow(d), "rows\n"))
 
-  yr_zero_var <- c("hospital_type", "sex", "year") %>%
+  yr_zero_var <- c("hospital_type", "sex", "year_centered") %>%
     purrr::keep(~ {
       col <- d[[.x]]
       if (is.factor(col)) nlevels(droplevels(col)) < 2
       else length(unique(col[!is.na(col)])) < 2
     })
 
-  yr_covariates <- setdiff(covariate_terms, c(yr_zero_var, "year"))
+  yr_covariates <- setdiff(covariate_terms, c(yr_zero_var, "year_centered"))
   yr_formula    <- reformulate(
     termlabels = c("defined_w_lactic * lactate_vol_scaled", yr_covariates,
                    if (re_structure != "single_hospital") "(1 | hospital_id)" else NULL),
@@ -799,7 +813,7 @@ coef_sa2b_list <- map(years_available, function(yr) {
 
   if (is.null(fit)) return(NULL)
 
-  vcov_yr     <- vcovCL(fit, cluster = d$hospitalization_id)
+  vcov_yr     <- robust_vcov(fit, cluster = d$hospitalization_id)
   coef_yr_raw <- coeftest(fit, vcov = vcov_yr)
   tidy_coeftest(coef_yr_raw) %>%
     mutate(conf.low            = estimate - 1.96 * std.error,
@@ -824,7 +838,7 @@ cat("Fitting SA3: within-year centered lactate volume\n")
 df_sa3 <- df_model
 formula_sa3 <- reformulate(
   termlabels = c("defined_w_lactic * lactate_volume_centered",
-                 setdiff(covariate_terms, "year"),
+                 setdiff(covariate_terms, "year_centered"),
                  if (re_structure != "single_hospital") "(1 | hospital_id)" else NULL),
   response = "outcome"
 )
@@ -847,7 +861,7 @@ model_sa3 <- withCallingHandlers(
 )
 
 if (!is.null(model_sa3)) {
-  vcov_sa3     <- vcovCL(model_sa3, cluster = df_sa3$hospitalization_id)
+  vcov_sa3     <- robust_vcov(model_sa3, cluster = df_sa3$hospitalization_id)
   coef_sa3_raw <- coeftest(model_sa3, vcov = vcov_sa3)
   coef_sa3 <- tidy_coeftest(coef_sa3_raw) %>%
     mutate(conf.low         = estimate - 1.96 * std.error,
@@ -914,6 +928,7 @@ output_list <- list(
   dropped_covariates   = zero_var_covariates,
   lactate_mean         = lactate_center,
   lactate_sd           = lactate_scale,
+  year_center          = year_center,
   # Primary model
   coef_primary         = coef_table,
   vcov_primary         = vcov_matrix,
