@@ -57,7 +57,7 @@ This document implements the pre-specified analysis for the ASE Definition Compa
 library(tidyverse)   # includes purrr
 library(lme4)        # glmer for multi-hospital sites
 library(sandwich)    # vcovCL clustered SEs
-library(clubSandwich)  # vcovCR clustered SEs (glmer path — sandwich lacks estfun for merMod)
+library(merDeriv)
 library(lmtest)      # coeftest
 library(jsonlite)
 library(arrow)
@@ -66,6 +66,7 @@ library(gtsummary)
 library(broom)
 library(scales)
 library(knitr)
+library(clubSandwich)
 # library(splines)   # available if needed for nonlinear terms
 # library(tableone)  # optional: for descriptive tables
 
@@ -554,6 +555,7 @@ cat(paste("Lactate volume scaling: mean =", lactate_center, "| SD =", lactate_sc
 cat(paste("Year centering offset:", year_center, "\n"))
 
 # 4.2 Zero-variance covariate check ─────────────────────────────────────────────
+# Note: covariate list uses year_centered (not raw year) to avoid glmer scale warnings.
 zero_var_covariates <- c("worst_sofa_admission_to_24h", "age", "sex", "cci",
                          "hospital_type", "year_centered", "hospitalizations_from_ed_per_year") %>%
   purrr::keep(~ {
@@ -608,15 +610,19 @@ if (re_structure == "single_hospital") {
   )
 }
 
-robust_vcov <- function(model, cluster) {
+if (!is.null(model_primary)) {
+  # robust_vcov: routes clustered SE extraction by model class.
+  # vcovCL (sandwich) lacks estfun support for glmerMod objects — use vcovCR (clubSandwich) instead.
+  # CR0 = standard cluster-robust; equivalent to HC0 for large clusters.
+  # glm path keeps vcovCL for consistency with coordinating center expectations.
+  robust_vcov <- function(model, cluster) {
   if (inherits(model, "glmerMod")) {
     clubSandwich::vcovCR(model, cluster = cluster, type = "CR0")
   } else {
-    sandwich::vcovCL(model, cluster = cluster)
+    sandwich::vcovCL(model, cluster = cluster, type = "HC0")
   }
 }
 
-if (!is.null(model_primary)) {
   vcov_matrix <- robust_vcov(model_primary, cluster = df_model$hospitalization_id)
   coef_robust <- coeftest(model_primary, vcov = vcov_matrix)
   cat("Primary model fitted successfully.\n")
