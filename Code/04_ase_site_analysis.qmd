@@ -1,7 +1,6 @@
 ---
 title: "ASE Definition Comparison: Site-Level Analysis"
-subtitle: "CLIF Consortium — Federated Multi-Site Study"
-date: today
+
 format:
   html:
     toc: true
@@ -21,7 +20,7 @@ execute:
 
 # Overview
 
-This document implements the pre-specified analysis for the ASE Definition Comparison study. Sites should run this document from top to bottom without modification. All outputs are saved to the `output_to_share/` directory for return to the coordinating center.
+This document implements the pre-specified analysis for the ASE Definition Comparison study. Sites should run this document from top to bottom without modification. All outputs are saved to the directory specified by `output_directory` in `clif_config.json` for return to the coordinating center.
 
 **Study Question:** Does hospital-level lactate ordering intensity explain the gap between core and extended CDC Adult Sepsis Event (ASE) rates?
 
@@ -35,7 +34,7 @@ This document implements the pre-specified analysis for the ASE Definition Compa
 - **Primary estimand:** Contrast between `lactate_vol_scaled` coefficient in Model B minus Model A — does the gap between definitions widen at higher-testing hospitals?
 - **Contrast SE:** Conservative approximation `sqrt(Var_B + Var_A)` — assumes independence between models; slightly wider than exact SE since positive cross-model covariance is not subtracted
 
-**Required data file:** `ase_analysis_dataset.parquet` in the working directory
+**Required data file:** `analysis_dataset.parquet` in the `phi_directory` specified in `clif_config.json`
 
 **Required variables:**
 
@@ -72,10 +71,11 @@ library(knitr)
 
 set.seed(20240101)
 
-# ── Site configuration ────────────────────────────────────────────────────────
-# << EDIT THESE TWO LINES before rendering >>
-SITE_ID   <- "Rush"                                # replace with your site identifier
-DATA_PATH <- here("ase_analysis_dataset.parquet")  # update filename if different
+# ── Site configuration (from clif_config.json) ────────────────────────────────
+config     <- fromJSON(here("clif_config.json"))
+SITE_ID    <- config$site_name
+DATA_PATH  <- here(config$phi_directory, "analysis_dataset.parquet")
+OUTPUT_DIR <- here(config$output_directory)
 # ─────────────────────────────────────────────────────────────────────────────
 
 # Modeling approach — two paths:
@@ -90,10 +90,10 @@ DATA_PATH <- here("ase_analysis_dataset.parquet")  # update filename if differen
 # Primary contrast = lactate_vol_scaled coef(B) - coef(A)
 
 # Create output directories
-dir.create(here("output_to_share/figures"),     showWarnings = FALSE, recursive = TRUE)
-dir.create(here("output_to_share/tables"),      showWarnings = FALSE, recursive = TRUE)
-dir.create(here("output_to_share/diagnostics"), showWarnings = FALSE, recursive = TRUE)
-dir.create(here("output_to_share/models"),      showWarnings = FALSE, recursive = TRUE)
+dir.create(file.path(OUTPUT_DIR, "figures"),     showWarnings = FALSE, recursive = TRUE)
+dir.create(file.path(OUTPUT_DIR, "tables"),      showWarnings = FALSE, recursive = TRUE)
+dir.create(file.path(OUTPUT_DIR, "diagnostics"), showWarnings = FALSE, recursive = TRUE)
+dir.create(file.path(OUTPUT_DIR, "models"),      showWarnings = FALSE, recursive = TRUE)
 
 # ── Helper functions ──────────────────────────────────────────────────────────
 
@@ -262,7 +262,7 @@ baseline_completeness <- df_raw %>%
 
 kable(baseline_completeness, caption = "Baseline completeness — key analysis variables")
 write_csv(baseline_completeness,
-          here("output_to_share/diagnostics/01_baseline_completeness.csv"))
+          file.path(OUTPUT_DIR, "diagnostics", "01_baseline_completeness.csv"))
 
 # 1.3 Structure
 cat("\nData structure:\n")
@@ -330,7 +330,7 @@ qc_table <- df_wide %>%
 
 kable(qc_table, caption = "Patient group distribution including QC flag (pre-exclusion)")
 write_csv(qc_table,
-          here("output_to_share/diagnostics",
+          file.path(OUTPUT_DIR, "diagnostics",
                paste0(SITE_ID, "_02_patient_group_qc.csv")))
 
 if (n_check_dq > 0)
@@ -583,7 +583,7 @@ fig_lactate_trend <- ggplot() +
         axis.title.y.right = element_text(color = "firebrick"),
         axis.text.y.right  = element_text(color = "firebrick"))
 
-ggsave(here("output_to_share/figures", paste0(SITE_ID, "_fig1_lactate_ase_trend.png")),
+ggsave(file.path(OUTPUT_DIR, "figures", paste0(SITE_ID, "_fig1_lactate_ase_trend.png")),
        plot = fig_lactate_trend, width = 9, height = 5.5, dpi = 300)
 fig_lactate_trend
 ```
@@ -619,7 +619,7 @@ fig_ase_gap <- ggplot() +
   theme_minimal(base_size = 13) +
   theme(plot.title = element_text(face = "bold"), panel.grid.minor = element_blank())
 
-ggsave(here("output_to_share/figures", paste0(SITE_ID, "_fig2_ase_rate_gap.png")),
+ggsave(file.path(OUTPUT_DIR, "figures", paste0(SITE_ID, "_fig2_ase_rate_gap.png")),
        plot = fig_ase_gap, width = 8, height = 5, dpi = 300)
 fig_ase_gap
 ```
@@ -646,7 +646,7 @@ fig_group_dist <- group_summary %>%
         panel.grid.minor   = element_blank(),
         panel.grid.major.x = element_blank())
 
-ggsave(here("output_to_share/figures", paste0(SITE_ID, "_fig3_patient_group_distribution.png")),
+ggsave(file.path(OUTPUT_DIR, "figures", paste0(SITE_ID, "_fig3_patient_group_distribution.png")),
        plot = fig_group_dist, width = 7, height = 5, dpi = 300)
 fig_group_dist
 ```
@@ -679,7 +679,7 @@ if (nrow(group_clinical) == 2) {
           legend.position  = "bottom",
           strip.text       = element_text(face = "bold"))
 
-  ggsave(here("output_to_share/figures", paste0(SITE_ID, "_fig4_clinical_profile.png")),
+  ggsave(file.path(OUTPUT_DIR, "figures", paste0(SITE_ID, "_fig4_clinical_profile.png")),
          plot = fig_clinical_profile, width = 8, height = 6, dpi = 300)
   fig_clinical_profile
 } else {
@@ -1206,68 +1206,68 @@ output_list <- list(
 
 # 6.2 Export CSVs
 write_csv(baseline_completeness,
-          here("output_to_share/diagnostics",
+          file.path(OUTPUT_DIR, "diagnostics",
                paste0(SITE_ID, "_01_baseline_completeness.csv")))
 write_csv(qc_table,
-          here("output_to_share/diagnostics",
+          file.path(OUTPUT_DIR, "diagnostics",
                paste0(SITE_ID, "_02_patient_group_qc.csv")))
 write_csv(
   tibble(site_id = SITE_ID, cor_lactate_year = cor_lactate_year,
          collinearity_flag = abs(cor_lactate_year) > 0.7),
-  here("output_to_share/diagnostics",
+  file.path(OUTPUT_DIR, "diagnostics",
        paste0(SITE_ID, "_03_cor_lactate_year.csv")))
 
 write_csv(cohort_summary,
-          here("output_to_share/tables", paste0(SITE_ID, "_01_cohort_summary.csv")))
+          file.path(OUTPUT_DIR, "tables", paste0(SITE_ID, "_01_cohort_summary.csv")))
 write_csv(ase_rate_by_year,
-          here("output_to_share/tables", paste0(SITE_ID, "_02_ase_rate_by_year.csv")))
+          file.path(OUTPUT_DIR, "tables", paste0(SITE_ID, "_02_ase_rate_by_year.csv")))
 write_csv(hosp_year_summary,
-          here("output_to_share/tables", paste0(SITE_ID, "_03_hosp_year_lactate_summary.csv")))
+          file.path(OUTPUT_DIR, "tables", paste0(SITE_ID, "_03_hosp_year_lactate_summary.csv")))
 write_csv(hosp_year_detail,
-          here("output_to_share/tables", paste0(SITE_ID, "_04_hosp_year_lactate_detail.csv")))
+          file.path(OUTPUT_DIR, "tables", paste0(SITE_ID, "_04_hosp_year_lactate_detail.csv")))
 write_csv(hosp_year_ase,
-          here("output_to_share/tables", paste0(SITE_ID, "_05_hosp_year_ase_rates.csv")))
+          file.path(OUTPUT_DIR, "tables", paste0(SITE_ID, "_05_hosp_year_ase_rates.csv")))
 write_csv(group_summary,
-          here("output_to_share/tables", paste0(SITE_ID, "_06_patient_group_distribution.csv")))
+          file.path(OUTPUT_DIR, "tables", paste0(SITE_ID, "_06_patient_group_distribution.csv")))
 write_csv(group_clinical,
-          here("output_to_share/tables", paste0(SITE_ID, "_07_clinical_profile_by_group.csv")))
+          file.path(OUTPUT_DIR, "tables", paste0(SITE_ID, "_07_clinical_profile_by_group.csv")))
 
 write_if(coef_primary,
-         here("output_to_share/models", paste0(SITE_ID, "_08_primary_model_coefs.csv")))
+         file.path(OUTPUT_DIR, "models", paste0(SITE_ID, "_08_primary_model_coefs.csv")))
 write_if(contrast_primary,
-         here("output_to_share/models", paste0(SITE_ID, "_09_primary_contrast.csv")))
+         file.path(OUTPUT_DIR, "models", paste0(SITE_ID, "_09_primary_contrast.csv")))
 write_if(blup_df,
-         here("output_to_share/models", paste0(SITE_ID, "_10_hospital_level_blups.csv")))
+         file.path(OUTPUT_DIR, "models", paste0(SITE_ID, "_10_hospital_level_blups.csv")))
 write_if(coef_sa1,
-         here("output_to_share/models", paste0(SITE_ID, "_11_sa1_lactate_ordered_coefs.csv")))
+         file.path(OUTPUT_DIR, "models", paste0(SITE_ID, "_11_sa1_lactate_ordered_coefs.csv")))
 write_if(contrast_sa1,
-         here("output_to_share/models", paste0(SITE_ID, "_12_sa1_lactate_ordered_contrast.csv")))
+         file.path(OUTPUT_DIR, "models", paste0(SITE_ID, "_12_sa1_lactate_ordered_contrast.csv")))
 write_if(coef_sa2a,
-         here("output_to_share/models", paste0(SITE_ID, "_13_sa2a_exclude_covid_coefs.csv")))
+         file.path(OUTPUT_DIR, "models", paste0(SITE_ID, "_13_sa2a_exclude_covid_coefs.csv")))
 write_if(contrast_sa2a,
-         here("output_to_share/models", paste0(SITE_ID, "_14_sa2a_exclude_covid_contrast.csv")))
+         file.path(OUTPUT_DIR, "models", paste0(SITE_ID, "_14_sa2a_exclude_covid_contrast.csv")))
 write_if(coef_sa2b,
-         here("output_to_share/models", paste0(SITE_ID, "_15_sa2b_year_stratified_coefs.csv")))
+         file.path(OUTPUT_DIR, "models", paste0(SITE_ID, "_15_sa2b_year_stratified_coefs.csv")))
 write_if(contrast_sa2b,
-         here("output_to_share/models", paste0(SITE_ID, "_16_sa2b_year_stratified_contrast.csv")))
+         file.path(OUTPUT_DIR, "models", paste0(SITE_ID, "_16_sa2b_year_stratified_contrast.csv")))
 write_if(coef_sa3,
-         here("output_to_share/models", paste0(SITE_ID, "_17_sa3_centered_lactate_coefs.csv")))
+         file.path(OUTPUT_DIR, "models", paste0(SITE_ID, "_17_sa3_centered_lactate_coefs.csv")))
 write_if(contrast_sa3,
-         here("output_to_share/models", paste0(SITE_ID, "_18_sa3_centered_lactate_contrast.csv")))
+         file.path(OUTPUT_DIR, "models", paste0(SITE_ID, "_18_sa3_centered_lactate_contrast.csv")))
 
 # vcov exported as separate CSVs for coordinating center use
 if (!is.null(vcov_a))
   write_csv(as.data.frame(vcov_a),
-            here("output_to_share/models", paste0(SITE_ID, "_19_vcov_model_a.csv")))
+            file.path(OUTPUT_DIR, "models", paste0(SITE_ID, "_19_vcov_model_a.csv")))
 if (!is.null(vcov_b))
   write_csv(as.data.frame(vcov_b),
-            here("output_to_share/models", paste0(SITE_ID, "_20_vcov_model_b.csv")))
+            file.path(OUTPUT_DIR, "models", paste0(SITE_ID, "_20_vcov_model_b.csv")))
 
 cat("CSV exports complete.\n")
 
 # 6.3 RDS + JSON
 saveRDS(output_list,
-        file = here("output_to_share/models",
+        file = file.path(OUTPUT_DIR, "models",
                     paste0(SITE_ID, "_ASE_results.rds")))
 
 output_json <- output_list
@@ -1277,12 +1277,12 @@ output_json$vcov_model_a <- if (!is.null(vcov_a)) as.data.frame(vcov_a) else NUL
 output_json$vcov_model_b <- if (!is.null(vcov_b)) as.data.frame(vcov_b) else NULL
 
 write_json(output_json,
-           path       = here("output_to_share/models",
+           path       = file.path(OUTPUT_DIR, "models",
                              paste0(SITE_ID, "_ASE_results.json")),
            pretty     = TRUE, auto_unbox = TRUE, na = "null")
 
 cat("RDS and JSON exports complete.\n")
-cat("All outputs saved to output_to_share/ — share entire folder with coordinating center.\n")
+cat(paste0("All outputs saved to ", OUTPUT_DIR, " — share entire folder with coordinating center.\n"))
 ```
 
 ---
@@ -1291,7 +1291,7 @@ cat("All outputs saved to output_to_share/ — share entire folder with coordina
 
 ```{r session-info}
 writeLines(capture.output(sessionInfo()),
-           here("output_to_share/diagnostics",
+           file.path(OUTPUT_DIR, "diagnostics",
                 paste0(SITE_ID, "_session_info.txt")))
 sessionInfo()
 ```
@@ -1300,49 +1300,49 @@ sessionInfo()
 
 # Output File Summary
 
-The following files have been saved to the `output_to_share/` directory for return to the coordinating center.
+The following files have been saved to the `<output_directory>/` directory (as configured in `clif_config.json`) for return to the coordinating center.
 
 **Diagnostics (return all):**
 
-- `diagnostics/[SITE]_01_baseline_completeness.csv`
-- `diagnostics/[SITE]_02_patient_group_qc.csv`
-- `diagnostics/[SITE]_03_cor_lactate_year.csv`
-- `diagnostics/[SITE]_session_info.txt`
+- `<output_directory>/diagnostics/[SITE]_01_baseline_completeness.csv`
+- `<output_directory>/diagnostics/[SITE]_02_patient_group_qc.csv`
+- `<output_directory>/diagnostics/[SITE]_03_cor_lactate_year.csv`
+- `<output_directory>/diagnostics/[SITE]_session_info.txt`
 
 **Tables (return all):**
 
-- `tables/[SITE]_01_cohort_summary.csv`
-- `tables/[SITE]_02_ase_rate_by_year.csv`
-- `tables/[SITE]_03_hosp_year_lactate_summary.csv`
-- `tables/[SITE]_04_hosp_year_lactate_detail.csv` — hospital-year detail ⭐
-- `tables/[SITE]_05_hosp_year_ase_rates.csv` — hospital-year ASE rates ⭐
-- `tables/[SITE]_06_patient_group_distribution.csv`
-- `tables/[SITE]_07_clinical_profile_by_group.csv`
+- `<output_directory>/tables/[SITE]_01_cohort_summary.csv`
+- `<output_directory>/tables/[SITE]_02_ase_rate_by_year.csv`
+- `<output_directory>/tables/[SITE]_03_hosp_year_lactate_summary.csv`
+- `<output_directory>/tables/[SITE]_04_hosp_year_lactate_detail.csv` — hospital-year detail ⭐
+- `<output_directory>/tables/[SITE]_05_hosp_year_ase_rates.csv` — hospital-year ASE rates ⭐
+- `<output_directory>/tables/[SITE]_06_patient_group_distribution.csv`
+- `<output_directory>/tables/[SITE]_07_clinical_profile_by_group.csv`
 
 **Models (return all):**
 
-- `models/[SITE]_08_primary_model_coefs.csv` — coefficients, both models ⭐
-- `models/[SITE]_09_primary_contrast.csv` — **primary estimand** ⭐
-- `models/[SITE]_10_hospital_level_blups.csv` — hospital-level forest plot inputs ⭐
-- `models/[SITE]_11_sa1_lactate_ordered_coefs.csv`
-- `models/[SITE]_12_sa1_lactate_ordered_contrast.csv`
-- `models/[SITE]_13_sa2a_exclude_covid_coefs.csv`
-- `models/[SITE]_14_sa2a_exclude_covid_contrast.csv`
-- `models/[SITE]_15_sa2b_year_stratified_coefs.csv`
-- `models/[SITE]_16_sa2b_year_stratified_contrast.csv`
-- `models/[SITE]_17_sa3_centered_lactate_coefs.csv`
-- `models/[SITE]_18_sa3_centered_lactate_contrast.csv`
-- `models/[SITE]_19_vcov_model_a.csv` — vcov for Model A (coordinating center use)
-- `models/[SITE]_20_vcov_model_b.csv` — vcov for Model B (coordinating center use)
-- `models/[SITE]_ASE_results.rds` — full output bundle ⭐
-- `models/[SITE]_ASE_results.json`
+- `<output_directory>/models/[SITE]_08_primary_model_coefs.csv` — coefficients, both models ⭐
+- `<output_directory>/models/[SITE]_09_primary_contrast.csv` — **primary estimand** ⭐
+- `<output_directory>/models/[SITE]_10_hospital_level_blups.csv` — hospital-level forest plot inputs ⭐
+- `<output_directory>/models/[SITE]_11_sa1_lactate_ordered_coefs.csv`
+- `<output_directory>/models/[SITE]_12_sa1_lactate_ordered_contrast.csv`
+- `<output_directory>/models/[SITE]_13_sa2a_exclude_covid_coefs.csv`
+- `<output_directory>/models/[SITE]_14_sa2a_exclude_covid_contrast.csv`
+- `<output_directory>/models/[SITE]_15_sa2b_year_stratified_coefs.csv`
+- `<output_directory>/models/[SITE]_16_sa2b_year_stratified_contrast.csv`
+- `<output_directory>/models/[SITE]_17_sa3_centered_lactate_coefs.csv`
+- `<output_directory>/models/[SITE]_18_sa3_centered_lactate_contrast.csv`
+- `<output_directory>/models/[SITE]_19_vcov_model_a.csv` — vcov for Model A (coordinating center use)
+- `<output_directory>/models/[SITE]_20_vcov_model_b.csv` — vcov for Model B (coordinating center use)
+- `<output_directory>/models/[SITE]_ASE_results.rds` — full output bundle ⭐
+- `<output_directory>/models/[SITE]_ASE_results.json`
 
 **Figures (return if flagged issues):**
 
-- `figures/[SITE]_fig1_lactate_ase_trend.png`
-- `figures/[SITE]_fig2_ase_rate_gap.png`
-- `figures/[SITE]_fig3_patient_group_distribution.png`
-- `figures/[SITE]_fig4_clinical_profile.png`
+- `<output_directory>/figures/[SITE]_fig1_lactate_ase_trend.png`
+- `<output_directory>/figures/[SITE]_fig2_ase_rate_gap.png`
+- `<output_directory>/figures/[SITE]_fig3_patient_group_distribution.png`
+- `<output_directory>/figures/[SITE]_fig4_clinical_profile.png`
 
 **Do NOT share (local only):**
 
