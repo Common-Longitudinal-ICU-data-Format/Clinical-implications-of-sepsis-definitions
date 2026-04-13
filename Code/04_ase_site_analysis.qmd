@@ -66,6 +66,7 @@ library(arrow)
 library(here)
 library(gtsummary)
 library(broom)
+library(broom.mixed)  # tidy() for glmerMod objects (glmer path)
 library(scales)
 library(knitr)
 
@@ -81,13 +82,7 @@ OUTPUT_DIR <- here(config$output_directory)
 # Modeling approach — two paths:
 #   >= 2 hospitals -> glmer with hospital RE (1 | hospital_id_deident), model-based SEs
 #   1 hospital     -> glm with clustered SEs on hospitalization_id (sandwich HC0)
-# Wide format (one row per hospitalization) eliminates within-hospitalization
-# clustering — glm path clusters on hospitalization_id only for within-hospitalization
-# repeated measures; glmer path handles between-hospital clustering via RE.
-# Two binary models fit per analysis:
-#   Model A: sepsis_core    (1) vs no_sepsis (0)
-#   Model B: sepsis_extended (1) vs no_sepsis (0)
-# Primary contrast = lactate_vol_scaled coef(B) - coef(A)
+
 
 # Create output directories
 dir.create(file.path(OUTPUT_DIR, "figures"),     showWarnings = FALSE, recursive = TRUE)
@@ -97,9 +92,7 @@ dir.create(file.path(OUTPUT_DIR, "models"),      showWarnings = FALSE, recursive
 
 # ── Helper functions ──────────────────────────────────────────────────────────
 
-# Fit a single binary logistic model (glmer or glm) with consistent
-# error/warning handling. Returns NULL on error.
-# model_path: "glmer" or "glm"
+# Fit a single binary logistic model (glmer or glm) with consistent error/warning handling. Returns NULL on error.
 # warn_var:   name of variable in parent frame to store convergence warning
 fit_binary <- function(formula, data, model_path, warn_var = "fit_warning") {
   assign(warn_var, NULL, envir = parent.frame())
@@ -141,20 +134,28 @@ get_model_vcov <- function(model, model_path, data) {
   }
 }
 
-# Tidy a fitted glmer or glm model into a clean data frame using broom.
+# Tidy a fitted glmer or glm model into a clean data frame.
 # Returns NULL if model is NULL.
+#   SEs are model-based from the GLMM likelihood; vcov_mat is still returned
+#   by get_model_vcov() and used downstream in compute_contrast().
+
 tidy_binary <- function(model, vcov_mat) {
   if (is.null(model)) return(NULL)
-  broom::tidy(lmtest::coeftest(model, vcov = vcov_mat)) %>%
-    mutate(conf.low  = estimate - 1.96 * std.error,
-           conf.high = estimate + 1.96 * std.error)
+
+  if (inherits(model, "glmerMod")) {
+    broom.mixed::tidy(model, effects = "fixed") %>%
+      select(term, estimate, std.error, statistic, p.value) %>%
+      mutate(conf.low  = estimate - 1.96 * std.error,
+             conf.high = estimate + 1.96 * std.error)
+  } else {
+    broom::tidy(lmtest::coeftest(model, vcov = vcov_mat)) %>%
+      mutate(conf.low  = estimate - 1.96 * std.error,
+             conf.high = estimate + 1.96 * std.error)
+  }
 }
 
 # Compute primary contrast from two tidy coefficient tables.
 # contrast = lactate_vol_scaled coef(model_b) - coef(model_a)
-# SE is conservative approximation: sqrt(var_b + var_a)
-# (exact SE would subtract 2*cov(a,b) but cross-model covariance not available
-#  from separate fits; approximation is conservative — slightly wider CIs)
 compute_contrast <- function(coef_a, coef_b, vcov_a, vcov_b,
                              lactate_term = "lactate_vol_scaled") {
   if (is.null(coef_a) || is.null(coef_b)) return(NULL)
@@ -215,6 +216,34 @@ add_metadata <- function(coef_df, model_version, site_id, n_hospitals,
 write_if <- function(x, path) {
   if (!is.null(x) && is.data.frame(x) && nrow(x) > 0)
     write_csv(x, path)
+}
+
+# Extract between-hospital random-intercept variance from a glmer fit.
+# Returns a one-row tibble with RE sigma^2 and sigma (SD).
+# glm path (single-hospital): returns a stub row with NAs and re_available = FALSE.
+# Used for two-level heterogeneity reporting at the coordinating center:
+#   - Within-site between-hospital variance (this export, multi-hospital sites)
+#   - Between-site variance (from meta-analytic pooling of contrast estimates)
+extract_re_variance <- function(model, model_label, model_path, site_id) {
+  if (model_path == "glmer" && !is.null(model)) {
+    vc      <- as.data.frame(VarCorr(model))
+    re_row  <- vc[vc$grp == "hospital_id_deident", ]
+    tibble(
+      site_id      = site_id,
+      model_label  = model_label,
+      re_sigma2    = if (nrow(re_row) > 0) re_row$vcov[1]  else NA_real_,
+      re_sigma     = if (nrow(re_row) > 0) re_row$sdcor[1] else NA_real_,
+      re_available = nrow(re_row) > 0
+    )
+  } else {
+    tibble(
+      site_id      = site_id,
+      model_label  = model_label,
+      re_sigma2    = NA_real_,
+      re_sigma     = NA_real_,
+      re_available = FALSE
+    )
+  }
 }
 
 # Load data
@@ -911,6 +940,19 @@ if (!is.null(blup_df)) {
   kable(blup_df, digits = 4,
         caption = "Hospital-level estimates (de-identified)")
 }
+
+# 4.9 RE variance export (primary models) ──────────────────────────────────────
+# Between-hospital random intercept variance from glmer (multi-hospital path).
+# Single-hospital path returns NA stubs so all sites return this file uniformly.
+# Coordinating center combines within-site RE variance (this file) with
+# between-site variance from meta-analytic pooling for two-level heterogeneity.
+re_var_primary <- bind_rows(
+  extract_re_variance(model_a, "model_a_core_vs_nosepsis",     model_path, SITE_ID),
+  extract_re_variance(model_b, "model_b_extended_vs_nosepsis", model_path, SITE_ID)
+)
+
+cat("\nBetween-hospital RE variance — primary models:\n")
+print(re_var_primary)
 ```
 
 ---
@@ -960,6 +1002,11 @@ if (!is.null(contrast_sa1))
   contrast_sa1 <- contrast_sa1 %>%
     mutate(site_id = SITE_ID, model_version = "sa1_lactate_ordered")
 
+re_var_sa1 <- bind_rows(
+  extract_re_variance(model_sa1_a, "model_a_core_vs_nosepsis",     model_path, SITE_ID),
+  extract_re_variance(model_sa1_b, "model_b_extended_vs_nosepsis", model_path, SITE_ID)
+)
+
 cat("SA1 complete.\n")
 if (nrow(coef_sa1) > 0)
   kable(coef_sa1 %>% filter(term == "lactate_vol_scaled") %>%
@@ -985,7 +1032,7 @@ df_sa2a_b <- df_model %>%
 
 if (nrow(df_sa2a_a) == 0) {
   cat("SA2a: No data outside 2020-2021 — skipping.\n")
-  coef_sa2a <- NULL; contrast_sa2a <- NULL
+  coef_sa2a <- NULL; contrast_sa2a <- NULL; re_var_sa2a <- NULL
 } else {
   cat(paste("SA2a Model A: n =", nrow(df_sa2a_a),
             "| Model B: n =", nrow(df_sa2a_b), "\n"))
@@ -1014,6 +1061,11 @@ if (nrow(df_sa2a_a) == 0) {
   if (!is.null(contrast_sa2a))
     contrast_sa2a <- contrast_sa2a %>%
       mutate(site_id = SITE_ID, model_version = "sa2a_exclude_covid")
+
+  re_var_sa2a <- bind_rows(
+    extract_re_variance(model_sa2a_a, "model_a_core_vs_nosepsis",     model_path, SITE_ID),
+    extract_re_variance(model_sa2a_b, "model_b_extended_vs_nosepsis", model_path, SITE_ID)
+  )
 
   cat("SA2a complete.\n")
   if (nrow(coef_sa2a) > 0)
@@ -1081,11 +1133,18 @@ sa2b_results <- map(years_available, function(yr) {
     contrast <- contrast %>% mutate(year = yr, site_id = SITE_ID,
                                     model_version = "sa2b_year_stratified")
 
-  list(coefs = if (nrow(coefs) > 0) coefs else NULL, contrast = contrast)
+  re_var <- bind_rows(
+    extract_re_variance(fit_a, "model_a_core_vs_nosepsis",     model_path, SITE_ID),
+    extract_re_variance(fit_b, "model_b_extended_vs_nosepsis", model_path, SITE_ID)
+  ) %>% mutate(year = yr)
+
+  list(coefs = if (nrow(coefs) > 0) coefs else NULL, contrast = contrast,
+       re_var = re_var)
 })
 
 coef_sa2b     <- bind_rows(map(sa2b_results, "coefs"))
 contrast_sa2b <- bind_rows(map(sa2b_results, "contrast"))
+re_var_sa2b   <- bind_rows(map(sa2b_results, "re_var"))
 
 cat(paste("SA2b complete:", length(years_available), "years attempted.\n"))
 if (nrow(coef_sa2b) > 0)
@@ -1149,6 +1208,11 @@ if (!is.null(contrast_sa3))
     mutate(site_id = SITE_ID, model_version = "sa3_centered_lactate",
            centering_method = centering_method)
 
+re_var_sa3 <- bind_rows(
+  extract_re_variance(model_sa3_a, "model_a_core_vs_nosepsis",     model_path, SITE_ID),
+  extract_re_variance(model_sa3_b, "model_b_extended_vs_nosepsis", model_path, SITE_ID)
+)
+
 cat("SA3 complete.\n")
 if (nrow(coef_sa3) > 0)
   kable(coef_sa3 %>% filter(grepl("lactate", term)) %>%
@@ -1198,6 +1262,11 @@ output_list <- list(
   contrast_sa2b        = contrast_sa2b,
   coef_sa3             = coef_sa3,
   contrast_sa3         = contrast_sa3,
+  re_var_primary       = re_var_primary,
+  re_var_sa1           = re_var_sa1,
+  re_var_sa2a          = re_var_sa2a,
+  re_var_sa2b          = re_var_sa2b,
+  re_var_sa3           = re_var_sa3,
   fig_lactate_trend    = fig_lactate_trend,
   fig_ase_gap          = fig_ase_gap,
   fig_group_dist       = fig_group_dist,
@@ -1262,6 +1331,18 @@ if (!is.null(vcov_a))
 if (!is.null(vcov_b))
   write_csv(as.data.frame(vcov_b),
             file.path(OUTPUT_DIR, "models", paste0(SITE_ID, "_20_vcov_model_b.csv")))
+
+# RE variance exports — between-hospital sigma^2 from glmer (NAs for single-hospital path)
+write_if(re_var_primary,
+         file.path(OUTPUT_DIR, "models", paste0(SITE_ID, "_21_re_variance_primary.csv")))
+write_if(re_var_sa1,
+         file.path(OUTPUT_DIR, "models", paste0(SITE_ID, "_22_re_variance_sa1.csv")))
+write_if(re_var_sa2a,
+         file.path(OUTPUT_DIR, "models", paste0(SITE_ID, "_23_re_variance_sa2a.csv")))
+write_if(re_var_sa2b,
+         file.path(OUTPUT_DIR, "models", paste0(SITE_ID, "_24_re_variance_sa2b.csv")))
+write_if(re_var_sa3,
+         file.path(OUTPUT_DIR, "models", paste0(SITE_ID, "_25_re_variance_sa3.csv")))
 
 cat("CSV exports complete.\n")
 
@@ -1334,6 +1415,11 @@ The following files have been saved to the `<output_directory>/` directory (as c
 - `<output_directory>/models/[SITE]_18_sa3_centered_lactate_contrast.csv`
 - `<output_directory>/models/[SITE]_19_vcov_model_a.csv` — vcov for Model A (coordinating center use)
 - `<output_directory>/models/[SITE]_20_vcov_model_b.csv` — vcov for Model B (coordinating center use)
+- `<output_directory>/models/[SITE]_21_re_variance_primary.csv` — between-hospital RE variance, primary models (glmer: sigma^2 + sigma; glm: NA stubs) ⭐
+- `<output_directory>/models/[SITE]_22_re_variance_sa1.csv` — RE variance, SA1 (lactate ordered only)
+- `<output_directory>/models/[SITE]_23_re_variance_sa2a.csv` — RE variance, SA2a (exclude COVID years)
+- `<output_directory>/models/[SITE]_24_re_variance_sa2b.csv` — RE variance, SA2b (year-stratified, one row per year per model)
+- `<output_directory>/models/[SITE]_25_re_variance_sa3.csv` — RE variance, SA3 (centered lactate)
 - `<output_directory>/models/[SITE]_ASE_results.rds` — full output bundle ⭐
 - `<output_directory>/models/[SITE]_ASE_results.json`
 
