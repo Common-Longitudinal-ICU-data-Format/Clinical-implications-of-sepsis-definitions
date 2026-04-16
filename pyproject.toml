@@ -5,7 +5,7 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.13, <3.14"
 dependencies = [
-    "clifpy>=0.4.0",
+    "clifpy>=0.4.6",
     "marimo>=0.20.4",
     "plotly>=6.6.0",
 ]
