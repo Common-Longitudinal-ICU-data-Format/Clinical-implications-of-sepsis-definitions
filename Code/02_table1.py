@@ -356,7 +356,7 @@ def _(ase_df, hosp_ids, micro, pd):
     window_bc_cultures = micro_with_index[abs(micro_with_index['days_from_index']) <= 2].copy()
 
     # Load contaminant organism list and reclassify (case-insensitive)
-    _contaminants_df = pd.read_csv("code/contaminants_organism_category.csv")
+    _contaminants_df = pd.read_csv("Code/contaminants_organism_category.csv")
     _contaminant_set = set(_contaminants_df['organism_category'].str.lower())
     index_bc_cultures.loc[index_bc_cultures['organism_category'].str.lower().isin(_contaminant_set), 'organism_category'] = 'contaminant'
     window_bc_cultures.loc[window_bc_cultures['organism_category'].str.lower().isin(_contaminant_set), 'organism_category'] = 'contaminant'
