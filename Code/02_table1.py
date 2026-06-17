@@ -963,6 +963,14 @@ def _(
     # N
     table1_rows.append({'Variable': 'N', **{nm: str(len(df)) for nm, df in groups.items()}})
 
+    # Prevalence (% of all encounters) — denominator is the Total group
+    _total_n = len(groups['Total'])
+    table1_rows.append({
+        'Variable': 'Prevalence (% of all encounters)',
+        **{nm: f"{100*len(df)/_total_n:.1f}%" if _total_n > 0 else 'N/A'
+           for nm, df in groups.items()}
+    })
+
     # Demographics
     table1_rows.append({'Variable': '--- Demographics ---', **{nm: '' for nm in groups}})
     table1_rows.append({'Variable': 'Age, mean (SD)', **{nm: summarize_continuous(df, 'age_at_admission') for nm, df in groups.items()}})
@@ -1624,6 +1632,14 @@ def _(
 
         # N
         rws.append({'Variable': 'N', **{n: str(len(g)) for n, g in grps.items()}})
+
+        # Prevalence (% of all encounters in stratum) — denominator is the Total group
+        _tot_n = len(grps['Total'])
+        rws.append({
+            'Variable': 'Prevalence (% of all encounters)',
+            **{n: f"{100*len(g)/_tot_n:.1f}%" if _tot_n > 0 else 'N/A'
+               for n, g in grps.items()}
+        })
 
         # Demographics
         rws.append({'Variable': '--- Demographics ---', **{n: '' for n in grps}})
