@@ -46,21 +46,27 @@ def _():
 
 @app.cell
 def _(Path, json):
-    # Load configuration
-    config_path = Path("clif_config.json")
-    config = json.loads(config_path.read_text())
+    # Single config file. CLIF_DATA_DIR is overridden to the encounter-level
+    # stitched tables that 01_cohort.py materialized under
+    # <phi_directory>/intermediate/ so labs/etc. loaded here are keyed by the
+    # stitched encounter id.
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import stitch_utils as su
 
-    CLIF_DATA_DIR = Path(config["data_directory"])
+    config = json.loads(Path("clif_config.json").read_text())
+
     FILETYPE = config["filetype"]
     TIMEZONE = config["timezone"]
     OUTPUT_DIR = Path(config["output_directory"])
     PHI_DIR = Path(config["phi_directory"])
     SITE_NAME = config["site_name"]
+    CLIF_DATA_DIR = su.stitched_dir(PHI_DIR)
 
     print(f"Site: {SITE_NAME}")
     print(f"Output directory: {OUTPUT_DIR}")
     print(f"PHI directory: {PHI_DIR}")
-    print(f"CLIF data directory: {CLIF_DATA_DIR}")
+    print(f"CLIF data directory (stitched): {CLIF_DATA_DIR}")
     return CLIF_DATA_DIR, FILETYPE, OUTPUT_DIR, PHI_DIR, SITE_NAME, TIMEZONE
 
 

@@ -36,11 +36,16 @@ This document implements the pre-specified analysis for the ASE Definition Compa
 
 **Required data file:** `analysis_dataset.parquet` in the `phi_directory` specified in `clif_config.json`
 
+::: {.callout-note}
+## Unit of analysis: stitched encounters
+`hospitalization_id` in `analysis_dataset.parquet` denotes a **stitched encounter** (`EB<n>`), not a raw hospitalization: hospitalizations of the same patient within a 6-hour window (discharge → next admission) were merged into a single encounter upstream in `01_cohort.py`. No change to this analysis is required — every row is still one encounter and the pivot/aggregation keys on `hospitalization_id` as before.
+:::
+
 **Required variables:**
 
 | Variable | Description |
 |---|---|
-| `hospitalization_id` | Unique hospitalization identifier |
+| `hospitalization_id` | Unique stitched-encounter identifier (`EB<n>`) |
 | `hospital_id` | Facility identifier |
 | `defined_w_lactic` | 0 = core ASE definition, 1 = extended (includes lactate criterion) |
 | `ASE` | 1 = meets ASE criteria under this definition, 0 = does not |

@@ -52,19 +52,24 @@ def _():
 
 @app.cell
 def _(Path, json):
-    # Load configuration
-    config_path = Path("clif_config.json")
-    config = json.loads(config_path.read_text())
+    # Single config file. DATA_DIR is overridden to the encounter-level stitched
+    # tables that 01_cohort.py materialized under <phi_directory>/intermediate/
+    # so all clifpy loads here see hospitalization_id == stitched encounter id.
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import stitch_utils as su
 
-    DATA_DIR = config["data_directory"]
+    config = json.loads(Path("clif_config.json").read_text())
+
     FILETYPE = config["filetype"]
     TIMEZONE = config["timezone"]
     OUTPUT_DIR = Path(config["output_directory"])
     PHI_DIR = Path(config["phi_directory"])
     SITE_NAME = config["site_name"]
+    DATA_DIR = str(su.stitched_dir(PHI_DIR))
 
     print(f"Site: {SITE_NAME}")
-    print(f"Data directory: {DATA_DIR}")
+    print(f"Data directory (stitched): {DATA_DIR}")
     return DATA_DIR, FILETYPE, OUTPUT_DIR, PHI_DIR, SITE_NAME, TIMEZONE
 
 
@@ -432,12 +437,12 @@ def _(mo):
 
 
 @app.cell
-def _(Path, cohort_df, json, pd):
+def _(DATA_DIR, FILETYPE, TIMEZONE, cohort_df, pd):
     import polars as pl
     from clifpy import compute_sofa_polars
 
-    # Load config
-    sofa_cfg = json.loads(Path("clif_config.json").read_text())
+    # Use the (stitched) data directory from config so SOFA reads encounter-level
+    # tables and matches the encounter-keyed cohort_df.
 
     # Create cohort DataFrame for Polars
     sofa_cohort = pl.DataFrame({
@@ -450,10 +455,10 @@ def _(Path, cohort_df, json, pd):
 
     # Compute SOFA scores using high-performance Polars implementation
     sofa_scores_pl = compute_sofa_polars(
-        data_directory=sofa_cfg["data_directory"],
+        data_directory=DATA_DIR,
         cohort_df=sofa_cohort,
-        filetype=sofa_cfg["filetype"],
-        timezone=sofa_cfg["timezone"],
+        filetype=FILETYPE,
+        timezone=TIMEZONE,
         fill_na_scores_with_zero=True,
         remove_outliers=True
     )

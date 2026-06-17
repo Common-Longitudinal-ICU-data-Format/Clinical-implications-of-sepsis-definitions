@@ -4,5 +4,6 @@
   "filetype": "parquet",
   "timezone": "America/Chicago",
   "output_directory": "./output_to_BOX",
-  "phi_directory": "./phi"
+  "phi_directory": "./phi",
+  "stitch_time_interval_hours": 6
 }
