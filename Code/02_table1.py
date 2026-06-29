@@ -87,6 +87,16 @@ def _(PHI_DIR, SITE_NAME, pd):
     cohort_df = pd.read_parquet(PHI_DIR / "cohort_df.parquet")
     ase_df = pd.read_parquet(PHI_DIR / "ase_results.parquet")
 
+    # 01_cohort.py's enrichment cell writes had_icu/icu_los_days/hospital_los_days/
+    # in_hospital_death into cohort_df.parquet for the analytic file. 02_table1.py
+    # owns canonical recomputation of these from the source tables; drop the
+    # pre-baked copies so the later merges don't collide into <col>_x / <col>_y.
+    _cohort_dup_cols = [c for c in (
+        "had_icu", "icu_los_days", "hospital_los_days", "in_hospital_death"
+    ) if c in cohort_df.columns]
+    if _cohort_dup_cols:
+        cohort_df = cohort_df.drop(columns=_cohort_dup_cols)
+
     # Get hosp_ids from base cohort
     hosp_ids = cohort_df['hospitalization_id'].astype(str).unique().tolist()
 
@@ -257,13 +267,21 @@ def _(adt, hosp_ids, pd):
     first_icu.columns = ['hospitalization_id', 'first_icu_dttm']
     icu_df = pd.merge(icu_df, first_icu, on='hospitalization_id', how='left')
 
-    # ICU LOS
-    icu_stays['icu_duration'] = (pd.to_datetime(icu_stays['out_dttm']) - pd.to_datetime(icu_stays['in_dttm'])).dt.total_seconds() / 86400
-    icu_los_agg = icu_stays.groupby('hospitalization_id')['icu_duration'].sum().reset_index()
+    # ICU LOS — drop ADT rows with out_dttm < in_dttm so inverted intervals
+    # don't subtract from the per-encounter sum.
+    icu_stays['icu_duration'] = (
+        pd.to_datetime(icu_stays['out_dttm']) - pd.to_datetime(icu_stays['in_dttm'])
+    ).dt.total_seconds() / 86400
+    n_inverted = int((icu_stays['icu_duration'] < 0).sum())
+    icu_valid = icu_stays[icu_stays['icu_duration'] >= 0]
+    icu_los_agg = icu_valid.groupby('hospitalization_id')['icu_duration'].sum().reset_index()
     icu_los_agg.columns = ['hospitalization_id', 'icu_los_days']
     icu_df = pd.merge(icu_df, icu_los_agg, on='hospitalization_id', how='left')
 
-    print(f"ICU indicators computed: {icu_df['had_icu'].sum():,} patients with ICU stay")
+    msg = f"ICU indicators computed: {icu_df['had_icu'].sum():,} patients with ICU stay"
+    if n_inverted > 0:
+        msg += f" (dropped {n_inverted:,} ADT rows with out_dttm < in_dttm)"
+    print(msg)
     return (icu_df,)
 
 

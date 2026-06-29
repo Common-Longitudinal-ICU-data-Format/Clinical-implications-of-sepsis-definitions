@@ -773,7 +773,7 @@ def _(
     print(f"Lactate orders per 1,000 patient-days saved to: {lactate_rate_path}")
     print(f"Shape: {lactate_rate.shape}")
     print(lactate_rate.head(10))
-    return lactate_counts, lactate_rate
+    return lactate_counts, lactate_labs, lactate_rate
 
 
 @app.cell
@@ -914,10 +914,138 @@ def _(
 @app.cell
 def _(
     PHI_DIR,
+    adt_stitched,
+    ase_results,
+    encounter_mapping,
+    final_cohort,
+    hospitalization,
+    lactate_counts,
+    lactate_labs,
+    pd,
+    su,
+):
+    # Enrich the stitched-encounter cohort with all hospitalization-level
+    # variables needed by the analytic dataset. Computed here (1 row per
+    # encounter) so the downstream merge into `analysis_df` (2 rows per
+    # encounter) cannot change row count.
+
+    enriched = final_cohort.copy()
+    _n0 = enriched["hospitalization_id"].nunique()
+    assert len(enriched) == _n0, "final_cohort already has duplicate encounter ids"
+
+    # --- 1. any_lactate_ordered_whole_hospitalization (renamed from any_lactate_ordered) ---
+    enriched = enriched.merge(
+        lactate_counts.assign(
+            any_lactate_ordered_whole_hospitalization=lambda d: d["lactate_orders"].gt(0).astype(int)
+        )[["hospitalization_id", "any_lactate_ordered_whole_hospitalization"]],
+        on="hospitalization_id",
+        how="left",
+    )
+    enriched["any_lactate_ordered_whole_hospitalization"] = (
+        enriched["any_lactate_ordered_whole_hospitalization"].fillna(0).astype(int)
+    )
+
+    # --- 2. lactate_ordered_in_window (±2 days of blood_culture_dttm) ---
+    bc_anchor = ase_results[["hospitalization_id", "blood_culture_dttm"]].dropna()
+    _lac = lactate_labs.df.merge(encounter_mapping, on="hospitalization_id", how="inner")
+    _lac["hospitalization_id"] = _lac["encounter_block"].map(su.encounter_id)
+    _lac = _lac.merge(bc_anchor, on="hospitalization_id", how="inner")
+    # lab_order_dttm can arrive as object dtype after the merge; coerce both
+    # sides to UTC datetime so the subtraction always yields a Timedelta.
+    _lac["lab_order_dttm"] = pd.to_datetime(_lac["lab_order_dttm"], utc=True, errors="coerce")
+    _lac["blood_culture_dttm"] = pd.to_datetime(_lac["blood_culture_dttm"], utc=True, errors="coerce")
+    _lac = _lac.dropna(subset=["lab_order_dttm", "blood_culture_dttm"])
+    _lac["days_from_bc"] = (
+        _lac["lab_order_dttm"] - _lac["blood_culture_dttm"]
+    ).dt.total_seconds() / 86400
+    _lac_win = _lac[_lac["days_from_bc"].abs() <= 2]
+    in_window_counts = (
+        _lac_win.groupby("hospitalization_id").size().reset_index(name="n_in_window")
+    )
+    enriched = enriched.merge(in_window_counts, on="hospitalization_id", how="left")
+    enriched["lactate_ordered_in_window"] = enriched["n_in_window"].fillna(0).gt(0).astype(int)
+    enriched = enriched.drop(columns="n_in_window")
+
+    assert (
+        enriched["lactate_ordered_in_window"]
+        <= enriched["any_lactate_ordered_whole_hospitalization"]
+    ).all(), "lactate_ordered_in_window > whole_hospitalization for some encounter"
+
+    # --- 3. hospital_los_days ---
+    enriched["hospital_los_days"] = (
+        (enriched["discharge_dttm"] - enriched["admission_dttm"]).dt.total_seconds() / 86400
+    ).clip(lower=0)
+
+    # --- 4. had_icu + icu_los_days (from stitched ADT) ---
+    # Per-stay duration is clipped at 0 to defend against source ADT rows where
+    # out_dttm < in_dttm (a data-quality artifact: a handful of stays yield
+    # ~−45,000-day durations and would wreck the sum). had_icu still reflects
+    # the presence of any ICU stay, regardless of timestamp quality.
+    icu_stays = adt_stitched[adt_stitched["location_category"].str.lower() == "icu"].copy()
+    icu_stays["icu_duration"] = (
+        (pd.to_datetime(icu_stays["out_dttm"]) - pd.to_datetime(icu_stays["in_dttm"]))
+        .dt.total_seconds() / 86400
+    ).clip(lower=0)
+    icu_los_agg = (
+        icu_stays.groupby("hospitalization_id")["icu_duration"].sum()
+        .reset_index().rename(columns={"icu_duration": "icu_los_days"})
+    )
+    enriched = enriched.merge(icu_los_agg, on="hospitalization_id", how="left")
+    enriched["had_icu"] = enriched["icu_los_days"].notna().astype(int)
+    enriched["icu_los_days"] = enriched["icu_los_days"].fillna(0)
+
+    # --- 5. in_hospital_death ---
+    # discharge_category lives on the per-hospitalization table; for a stitched
+    # encounter take the value from the LAST hospitalization in the block.
+    if "discharge_category" not in enriched.columns:
+        _hosp_with_block = hospitalization.df[
+            ["hospitalization_id", "discharge_dttm", "discharge_category"]
+        ].merge(encounter_mapping, on="hospitalization_id", how="inner")
+        last_disch = (
+            _hosp_with_block.sort_values("discharge_dttm")
+            .drop_duplicates("encounter_block", keep="last")
+            .copy()
+        )
+        last_disch["hospitalization_id"] = last_disch["encounter_block"].map(su.encounter_id)
+        enriched = enriched.merge(
+            last_disch[["hospitalization_id", "discharge_category"]],
+            on="hospitalization_id",
+            how="left",
+        )
+
+    enriched["in_hospital_death"] = (
+        enriched["discharge_category"].str.lower().str.contains("expired", na=False)
+        | (
+            enriched["death_dttm"].notna()
+            & (pd.to_datetime(enriched["death_dttm"]) <= enriched["discharge_dttm"])
+        )
+    ).astype(int)
+
+    # --- Invariants & save (overwrites cohort_df.parquet from Step 4) ---
+    assert enriched["hospitalization_id"].is_unique, "enrichment introduced duplicate encounter ids"
+    assert len(enriched) == _n0, f"enrichment changed row count: {_n0} -> {len(enriched)}"
+
+    enriched.to_parquet(PHI_DIR / "cohort_df.parquet", index=False)
+
+    print(f"Enriched cohort: {len(enriched):,} encounters, {enriched.shape[1]} columns")
+    print(f"  any_lactate_ordered_whole_hospitalization=1: {enriched['any_lactate_ordered_whole_hospitalization'].sum():,}")
+    print(f"  lactate_ordered_in_window=1: {enriched['lactate_ordered_in_window'].sum():,}")
+    print(f"  had_icu=1: {enriched['had_icu'].sum():,}")
+    print(f"  in_hospital_death=1: {enriched['in_hospital_death'].sum():,} "
+          f"({enriched['in_hospital_death'].mean()*100:.1f}%)")
+    print(f"  hospital_los_days median: {enriched['hospital_los_days'].median():.1f}d")
+    print(f"  icu_los_days median (ICU only): "
+          f"{enriched.loc[enriched['had_icu']==1, 'icu_los_days'].median():.1f}d")
+    return (enriched,)
+
+
+@app.cell
+def _(
+    PHI_DIR,
     ase_results,
     cci_df,
+    enriched,
     final_cohort,
-    lactate_counts,
     lactate_rate,
     pd,
     sofa_24h_df,
@@ -1011,9 +1139,23 @@ def _(
     pi_map = ase_results.drop_duplicates("hospitalization_id").set_index("hospitalization_id")["presumed_infection"]
     analysis_df["presumed_infection"] = analysis_df["hospitalization_id"].map(pi_map).fillna(0).astype(int)
 
-    # --- 7. Any lactate ordered (hospitalization-level) ---
-    lactate_flag = lactate_counts.set_index("hospitalization_id")["lactate_orders"].gt(0).astype(int)
-    analysis_df["any_lactate_ordered"] = analysis_df["hospitalization_id"].map(lactate_flag).fillna(0).astype(int)
+    # --- 7. Merge all enriched hospitalization-level variables in a single join ---
+    # `enriched` has one unique row per hospitalization_id (asserted upstream),
+    # so this left merge cannot change analysis_df row count.
+    NEW_COLS = [
+        "race_category", "ethnicity_category", "race_ethnicity",
+        "any_lactate_ordered_whole_hospitalization", "lactate_ordered_in_window",
+        "hospital_los_days", "had_icu", "icu_los_days", "in_hospital_death",
+    ]
+    _n_before = len(analysis_df)
+    analysis_df = analysis_df.merge(
+        enriched[["hospitalization_id"] + NEW_COLS],
+        on="hospitalization_id",
+        how="left",
+    )
+    assert len(analysis_df) == _n_before, (
+        f"enriched merge changed analysis_df row count: {_n_before} -> {len(analysis_df)}"
+    )
 
     # --- 8. Lactate ordering rate ---
     analysis_df["year"] = analysis_df["admission_dttm"].dt.year
@@ -1043,15 +1185,23 @@ def _(
         "onset_community1_hospital0",
         "age",
         "sex",
+        "race_category",
+        "ethnicity_category",
+        "race_ethnicity",
         "cci",
         "worst_sofa_admission_to_24h",
-        "any_lactate_ordered",
+        "any_lactate_ordered_whole_hospitalization",
+        "lactate_ordered_in_window",
         "presumed_infection",
         "hospital_id",
         "hospital_type",
         "lactate_order_per_1000_patient_days",
         "year",
         "hospitalizations_from_ed_per_year",
+        "hospital_los_days",
+        "had_icu",
+        "icu_los_days",
+        "in_hospital_death",
     ]
     analysis_df = analysis_df[final_cols]
 
@@ -1066,12 +1216,21 @@ def _(
     print(f"ASE=1 (wl=0): {analysis_df.loc[analysis_df['defined_w_lactic']==0, 'ASE'].sum():,}")
     print(f"SOFA non-null: {analysis_df['worst_sofa_admission_to_24h'].notna().sum():,}")
     print(f"CCI non-null: {analysis_df['cci'].notna().sum():,}")
-    print(f"any_lactate_ordered=1: {analysis_df['any_lactate_ordered'].sum():,}")
+    print(f"any_lactate_ordered_whole_hospitalization=1: {analysis_df['any_lactate_ordered_whole_hospitalization'].sum():,}")
+    print(f"lactate_ordered_in_window=1: {analysis_df['lactate_ordered_in_window'].sum():,}")
     print(f"presumed_infection=1: {analysis_df['presumed_infection'].sum():,}")
+    print(f"had_icu=1: {analysis_df['had_icu'].sum():,}")
+    print(f"in_hospital_death=1: {analysis_df['in_hospital_death'].sum():,} "
+          f"({analysis_df['in_hospital_death'].mean()*100:.1f}%)")
+    print(f"race_ethnicity distribution:\n{analysis_df.drop_duplicates('hospitalization_id')['race_ethnicity'].value_counts()}")
     print(f"Columns: {list(analysis_df.columns)}")
     print(f"hospital_type values: {analysis_df['hospital_type'].value_counts().to_dict()}")
     print(f"year range: {analysis_df['year'].min()}–{analysis_df['year'].max()}")
     print(f"hospitalizations_from_ed_per_year non-null: {analysis_df['hospitalizations_from_ed_per_year'].notna().sum():,}")
+    assert (
+        analysis_df["lactate_ordered_in_window"]
+        <= analysis_df["any_lactate_ordered_whole_hospitalization"]
+    ).all(), "lactate_ordered_in_window > whole_hospitalization in analysis_df"
     return
 
 
