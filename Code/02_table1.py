@@ -52,19 +52,24 @@ def _():
 
 @app.cell
 def _(Path, json):
-    # Load configuration
-    config_path = Path("clif_config.json")
-    config = json.loads(config_path.read_text())
+    # Single config file. DATA_DIR is overridden to the encounter-level stitched
+    # tables that 01_cohort.py materialized under <phi_directory>/intermediate/
+    # so all clifpy loads here see hospitalization_id == stitched encounter id.
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import stitch_utils as su
 
-    DATA_DIR = config["data_directory"]
+    config = json.loads(Path("clif_config.json").read_text())
+
     FILETYPE = config["filetype"]
     TIMEZONE = config["timezone"]
     OUTPUT_DIR = Path(config["output_directory"])
     PHI_DIR = Path(config["phi_directory"])
     SITE_NAME = config["site_name"]
+    DATA_DIR = str(su.stitched_dir(PHI_DIR))
 
     print(f"Site: {SITE_NAME}")
-    print(f"Data directory: {DATA_DIR}")
+    print(f"Data directory (stitched): {DATA_DIR}")
     return DATA_DIR, FILETYPE, OUTPUT_DIR, PHI_DIR, SITE_NAME, TIMEZONE
 
 
@@ -81,6 +86,16 @@ def _(PHI_DIR, SITE_NAME, pd):
     # Load cohort and ASE results from notebook 1 (PHI data)
     cohort_df = pd.read_parquet(PHI_DIR / "cohort_df.parquet")
     ase_df = pd.read_parquet(PHI_DIR / "ase_results.parquet")
+
+    # 01_cohort.py's enrichment cell writes had_icu/icu_los_days/hospital_los_days/
+    # in_hospital_death into cohort_df.parquet for the analytic file. 02_table1.py
+    # owns canonical recomputation of these from the source tables; drop the
+    # pre-baked copies so the later merges don't collide into <col>_x / <col>_y.
+    _cohort_dup_cols = [c for c in (
+        "had_icu", "icu_los_days", "hospital_los_days", "in_hospital_death"
+    ) if c in cohort_df.columns]
+    if _cohort_dup_cols:
+        cohort_df = cohort_df.drop(columns=_cohort_dup_cols)
 
     # Get hosp_ids from base cohort
     hosp_ids = cohort_df['hospitalization_id'].astype(str).unique().tolist()
@@ -252,13 +267,21 @@ def _(adt, hosp_ids, pd):
     first_icu.columns = ['hospitalization_id', 'first_icu_dttm']
     icu_df = pd.merge(icu_df, first_icu, on='hospitalization_id', how='left')
 
-    # ICU LOS
-    icu_stays['icu_duration'] = (pd.to_datetime(icu_stays['out_dttm']) - pd.to_datetime(icu_stays['in_dttm'])).dt.total_seconds() / 86400
-    icu_los_agg = icu_stays.groupby('hospitalization_id')['icu_duration'].sum().reset_index()
+    # ICU LOS — drop ADT rows with out_dttm < in_dttm so inverted intervals
+    # don't subtract from the per-encounter sum.
+    icu_stays['icu_duration'] = (
+        pd.to_datetime(icu_stays['out_dttm']) - pd.to_datetime(icu_stays['in_dttm'])
+    ).dt.total_seconds() / 86400
+    n_inverted = int((icu_stays['icu_duration'] < 0).sum())
+    icu_valid = icu_stays[icu_stays['icu_duration'] >= 0]
+    icu_los_agg = icu_valid.groupby('hospitalization_id')['icu_duration'].sum().reset_index()
     icu_los_agg.columns = ['hospitalization_id', 'icu_los_days']
     icu_df = pd.merge(icu_df, icu_los_agg, on='hospitalization_id', how='left')
 
-    print(f"ICU indicators computed: {icu_df['had_icu'].sum():,} patients with ICU stay")
+    msg = f"ICU indicators computed: {icu_df['had_icu'].sum():,} patients with ICU stay"
+    if n_inverted > 0:
+        msg += f" (dropped {n_inverted:,} ADT rows with out_dttm < in_dttm)"
+    print(msg)
     return (icu_df,)
 
 
@@ -432,12 +455,12 @@ def _(mo):
 
 
 @app.cell
-def _(Path, cohort_df, json, pd):
+def _(DATA_DIR, FILETYPE, TIMEZONE, cohort_df, pd):
     import polars as pl
     from clifpy import compute_sofa_polars
 
-    # Load config
-    sofa_cfg = json.loads(Path("clif_config.json").read_text())
+    # Use the (stitched) data directory from config so SOFA reads encounter-level
+    # tables and matches the encounter-keyed cohort_df.
 
     # Create cohort DataFrame for Polars
     sofa_cohort = pl.DataFrame({
@@ -450,10 +473,10 @@ def _(Path, cohort_df, json, pd):
 
     # Compute SOFA scores using high-performance Polars implementation
     sofa_scores_pl = compute_sofa_polars(
-        data_directory=sofa_cfg["data_directory"],
+        data_directory=DATA_DIR,
         cohort_df=sofa_cohort,
-        filetype=sofa_cfg["filetype"],
-        timezone=sofa_cfg["timezone"],
+        filetype=FILETYPE,
+        timezone=TIMEZONE,
         fill_na_scores_with_zero=True,
         remove_outliers=True
     )
@@ -957,6 +980,14 @@ def _(
 
     # N
     table1_rows.append({'Variable': 'N', **{nm: str(len(df)) for nm, df in groups.items()}})
+
+    # Prevalence (% of all encounters) — denominator is the Total group
+    _total_n = len(groups['Total'])
+    table1_rows.append({
+        'Variable': 'Prevalence (% of all encounters)',
+        **{nm: f"{100*len(df)/_total_n:.1f}%" if _total_n > 0 else 'N/A'
+           for nm, df in groups.items()}
+    })
 
     # Demographics
     table1_rows.append({'Variable': '--- Demographics ---', **{nm: '' for nm in groups}})
@@ -1619,6 +1650,14 @@ def _(
 
         # N
         rws.append({'Variable': 'N', **{n: str(len(g)) for n, g in grps.items()}})
+
+        # Prevalence (% of all encounters in stratum) — denominator is the Total group
+        _tot_n = len(grps['Total'])
+        rws.append({
+            'Variable': 'Prevalence (% of all encounters)',
+            **{n: f"{100*len(g)/_tot_n:.1f}%" if _tot_n > 0 else 'N/A'
+               for n, g in grps.items()}
+        })
 
         # Demographics
         rws.append({'Variable': '--- Demographics ---', **{n: '' for n in grps}})

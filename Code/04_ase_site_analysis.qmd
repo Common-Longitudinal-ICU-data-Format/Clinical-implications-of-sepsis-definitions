@@ -47,10 +47,18 @@ This document implements the pre-specified analysis for the ASE Definition Compa
 | `lactate_order_per_1000_patient_days` | Hospital-year lactate ordering intensity |
 | `worst_sofa_admission_to_24h` | SOFA score (0–24h from blood culture/antibiotic anchor) |
 | `age`, `sex`, `cci` | Patient demographics and comorbidity |
+| `race_category` | Raw CLIF race string from patient.df |
+| `ethnicity_category` | Raw CLIF ethnicity string (Hispanic / Non-Hispanic / Unknown) |
+| `race_ethnicity` | Composite: Non-Hispanic White / Non-Hispanic Black / Hispanic White / Hispanic Black / Asian / Other |
 | `hospital_type` | community or academic |
 | `year` | Calendar year |
 | `hospitalizations_from_ed_per_year` | Hospital-year ED volume |
-| `any_lactate_ordered` | 1 = any lactate ordered during hospitalization |
+| `any_lactate_ordered_whole_hospitalization` | 1 = any lactate ordered at any point during hospitalization |
+| `lactate_ordered_in_window` | 1 = ≥1 lactate order within ±2 days of blood-culture-anchored ASE window |
+| `hospital_los_days` | Hospitalization length of stay in days |
+| `had_icu` | 1 = any ICU stay during hospitalization |
+| `icu_los_days` | Total ICU length of stay in days (0 if had_icu == 0) |
+| `in_hospital_death` | 1 = died during hospitalization |
 
 ---
 
@@ -64,24 +72,35 @@ library(lmtest)     # coeftest()
 library(jsonlite)
 library(arrow)
 library(here)
-library(gtsummary)
 library(broom)
 library(broom.mixed)  # tidy() for glmerMod objects (glmer path)
 library(scales)
 library(knitr)
+library(patchwork)  # combine panels for fig_framing_comparison
 
 set.seed(20240101)
 
-# ── Site configuration (from clif_config.json) ────────────────────────────────
-config     <- fromJSON(here("clif_config.json"))
-SITE_ID    <- config$site_name
-DATA_PATH  <- here(config$phi_directory, "analysis_dataset.parquet")
-OUTPUT_DIR <- here(config$output_directory)
-# ─────────────────────────────────────────────────────────────────────────────
+# ── Site configuration (from clif_config.json) ───────────────────────────────
+config <- fromJSON(here("clif_config.json"))
 
-# Modeling approach — two paths:
-#   >= 2 hospitals -> glmer with hospital RE (1 | hospital_id_deident), model-based SEs
-#   1 hospital     -> glm with clustered SEs on hospitalization_id (sandwich HC0)
+resolve_config_path <- function(path) {
+  if (is.null(path) || length(path) != 1 || is.na(path) || !nzchar(path)) {
+    stop("Invalid path in clif_config.json")
+  }
+
+  path <- path.expand(path)
+  if (grepl("^(/|[A-Za-z]:[\\\\/])", path)) {
+    normalizePath(path, mustWork = FALSE)
+  } else {
+    here(path)
+  }
+}
+
+SITE_ID    <- config$site_name
+DATA_PATH  <- file.path(resolve_config_path(config$phi_directory),
+                        "analysis_dataset.parquet")
+OUTPUT_DIR <- resolve_config_path(config$output_directory)
+# ─────────────────────────────────────────────────────────────────────────────
 
 
 # Create output directories
@@ -286,7 +305,16 @@ baseline_completeness <- df_raw %>%
     lactate_vol_miss      = sum(is.na(lactate_order_per_1000_patient_days)),
     year_miss             = sum(is.na(year)),
     ASE_miss              = sum(is.na(ASE)),
-    defined_w_lactic_miss = sum(is.na(defined_w_lactic))
+    defined_w_lactic_miss = sum(is.na(defined_w_lactic)),
+    race_eth_miss         = sum(is.na(race_category) |
+                                    tolower(race_category) %in%
+                                      c("unknown", "not reported", "nan") |
+                                    is.na(ethnicity_category) |
+                                    tolower(ethnicity_category) %in%
+                                      c("unknown", "not reported", "other", "nan")),
+    lactate_window_miss   = sum(is.na(lactate_ordered_in_window)),
+    los_miss              = sum(is.na(hospital_los_days)),
+    in_hosp_death_miss    = sum(is.na(in_hospital_death))
   )
 
 kable(baseline_completeness, caption = "Baseline completeness — key analysis variables")
@@ -321,14 +349,19 @@ kable(row_counts, caption = "Expected: all hospitalizations should have exactly 
 df_wide <- df_raw %>%
   select(hospitalization_id, hospital_id, defined_w_lactic, ASE,
          lactate_order_per_1000_patient_days, worst_sofa_admission_to_24h,
-         age, sex, cci, hospital_type, year,
-         hospitalizations_from_ed_per_year, any_lactate_ordered) %>%
+         age, sex, cci, race_category, ethnicity_category, race_ethnicity,
+         hospital_type, year, hospitalizations_from_ed_per_year,
+         any_lactate_ordered_whole_hospitalization, lactate_ordered_in_window,
+         hospital_los_days, had_icu, icu_los_days, in_hospital_death) %>%
   pivot_wider(
     id_cols      = c(hospitalization_id, hospital_id,
                      lactate_order_per_1000_patient_days,
                      worst_sofa_admission_to_24h, age, sex, cci,
-                     hospital_type, year,
-                     hospitalizations_from_ed_per_year, any_lactate_ordered),
+                     race_category, ethnicity_category, race_ethnicity,
+                     hospital_type, year, hospitalizations_from_ed_per_year,
+                     any_lactate_ordered_whole_hospitalization,
+                     lactate_ordered_in_window, hospital_los_days,
+                     had_icu, icu_los_days, in_hospital_death),
     names_from   = defined_w_lactic,
     values_from  = ASE,
     names_prefix = "ASE_def_"
@@ -370,24 +403,230 @@ if (n_check_dq > 0)
 df <- df_wide %>%
   filter(patient_group != "check_data_quality") %>%
   mutate(
-    patient_group = factor(patient_group,
-                           levels = c("no_sepsis", "sepsis_core", "sepsis_extended")),
-    hospital_type = factor(hospital_type, levels = c("community", "academic")),
-    sex           = factor(sex,           levels = c("Male", "Female")),
-    year_f        = factor(year)
+    patient_group  = factor(patient_group,
+                            levels = c("no_sepsis", "sepsis_core", "sepsis_extended")),
+    hospital_type  = factor(hospital_type, levels = c("community", "academic")),
+    sex            = factor(sex,           levels = c("Male", "Female")),
+    year_f         = factor(year),
+    # Derive race_eth_model directly from raw race_category and ethnicity_category
+    # rather than relying on the pipeline's combined race_ethnicity variable.
+    # Three levels enter the adjusted model: NH_White (reference), NH_Black,
+    # Hispanic. NH_Asian and NH_Other are set to NA and excluded from models
+    # to ensure a consistent covariate specification across all sites — small
+    # or absent cells at some sites would cause these levels to be dropped
+    # inconsistently, producing non-exchangeable estimates at the CC.
+    # NH_Asian and NH_Other are retained in group_clinical for Table 1.
+    # Unknown/Missing → NA regardless.
+    #
+    # Priority order:
+    #   1. Unknown/Missing ethnicity or race → NA
+    #   2. Hispanic ethnicity (any race)     → Hispanic
+    #   3. Non-Hispanic White                → NH_White (reference)
+    #   4. Non-Hispanic Black                → NH_Black
+    #   5. All other Non-Hispanic            → NA (reported in Table 1 only)
+    race_eth_model = case_when(
+      is.na(ethnicity_category) |
+        tolower(ethnicity_category) %in% c("unknown", "not reported",
+                                            "other", "nan")           ~ NA_character_,
+      is.na(race_category) |
+        tolower(race_category) %in% c("unknown", "not reported",
+                                       "nan")                          ~ NA_character_,
+      tolower(ethnicity_category) == "hispanic"                        ~ "Hispanic",
+      tolower(ethnicity_category) %in% c("non-hispanic",
+                                          "not hispanic") &
+        tolower(race_category) == "white"                              ~ "NH_White",
+      tolower(ethnicity_category) %in% c("non-hispanic",
+                                          "not hispanic") &
+        tolower(race_category) %in% c("black or african american",
+                                       "black", "african american",
+                                       "black or african-american")    ~ "NH_Black",
+      tolower(ethnicity_category) %in% c("non-hispanic",
+                                          "not hispanic") &
+        tolower(race_category) == "asian"                              ~ NA_character_,
+      tolower(ethnicity_category) %in% c("non-hispanic",
+                                          "not hispanic")              ~ NA_character_,
+      TRUE                                                             ~ NA_character_
+    ),
+    race_eth_model = factor(race_eth_model,
+                            levels = c("NH_White", "NH_Black", "Hispanic"))
   )
 
 cat(paste("Analytic dataset after exclusions:", nrow(df), "hospitalizations\n"))
 
-# 2.4 Collinearity diagnostic: lactate volume vs year ──────────────────────────
-cor_lactate_year <- cor(df$lactate_order_per_1000_patient_days, df$year,
-                        use = "complete.obs")
-cat(paste("\nPearson r (lactate_order_per_1000_patient_days ~ year):",
+# race_eth_model distribution check
+cat("\nrace_eth_model distribution (derived from race_category + ethnicity_category):\n")
+df %>%
+  count(race_eth_model, .drop = FALSE) %>%
+  mutate(pct = round(n / sum(n) * 100, 1)) %>%
+  print(n = 10)
+
+# 2.4 ASE flag consistency cross-check ─────────────────────────────────────────
+# Cross-tabulates patient_group against lactate_ordered_in_window to verify
+# internal consistency between ASE-derived group classifications and the new
+# window-specific lactate flag variables.
+#
+# Expected patterns:
+#   sepsis_extended + window_lactate=0 → IMPOSSIBLE: classified as lactate-only
+#     ASE but no lactate drawn in window. Flag as data quality concern.
+#   sepsis_extended + window_lactate=1 → Expected ~100% of sepsis_extended.
+#   sepsis_core    + window_lactate=0 → Fine: qualified via core criteria; no
+#     window lactate drawn or ordered outside window.
+#   sepsis_core    + window_lactate=1 → Fine: core criteria met; lactate also
+#     drawn in window (overlap patients — both pathways active).
+#   no_sepsis      + window_lactate=0 → Structural non-observability: lactate
+#     criterion could never have been triggered regardless of result.
+#   no_sepsis      + window_lactate=1 → True negative opportunity: lactate
+#     drawn in window but result did not meet criterion (or was not elevated).
+```
+
+```{r ase-flag-crosscheck}
+# Cross-tab: patient_group × lactate_ordered_in_window
+flag_crosscheck <- df %>%
+  count(patient_group, lactate_ordered_in_window) %>%
+  group_by(patient_group) %>%
+  mutate(
+    pct    = round(n / sum(n) * 100, 1),
+    cell   = paste0(n, " (", pct, "%)")
+  ) %>%
+  ungroup() %>%
+  select(patient_group, lactate_ordered_in_window, cell) %>%
+  pivot_wider(
+    names_from   = lactate_ordered_in_window,
+    values_from  = cell,
+    names_prefix = "window_lactate_"
+  ) %>%
+  mutate(
+    total = df %>%
+      count(patient_group) %>%
+      pull(n)
+  )
+
+kable(flag_crosscheck,
+      caption = paste0(
+        "ASE group × lactate_ordered_in_window cross-check. ",
+        "sepsis_extended patients in window_lactate_0 column indicate a ",
+        "data quality concern — lactate-only ASE without window lactate draw."
+      ))
+
+# Flag: sepsis_extended patients with no window lactate
+n_extended_no_window <- df %>%
+  filter(patient_group == "sepsis_extended",
+         lactate_ordered_in_window == 0) %>%
+  nrow()
+
+if (n_extended_no_window > 0) {
+  warning(
+    n_extended_no_window,
+    " sepsis_extended patients have lactate_ordered_in_window == 0. ",
+    "These patients are classified as lactate-only ASE but have no lactate ",
+    "draw recorded in the ±2 day ASE window. Review upstream phenotyping — ",
+    "possible window definition mismatch between compute_ase() and ",
+    "lactate_ordered_in_window derivation."
+  )
+
+  # Diagnostic export: distinguish two candidate explanations using flags
+  # already available (no raw order timestamps in this analytic dataset).
+  #   any_lactate_ordered_whole_hospitalization == 1 → lactate WAS drawn
+  #     somewhere in the hospitalization, just not flagged as in-window.
+  #     Supports a window-boundary/anchor mismatch between compute_ase()
+  #     and the lactate_ordered_in_window derivation — the lactate exists,
+  #     it's just being filtered out by a stricter or differently-anchored
+  #     window in one pipeline step versus the other.
+  #   any_lactate_ordered_whole_hospitalization == 0 → no lactate order
+  #     recorded anywhere in the hospitalization at all. This is NOT a
+  #     window boundary issue — it means compute_ase() classified this
+  #     patient as lactate-only ASE despite no lactate order existing in
+  #     the source data for the entire admission. Points to a phenotyping-
+  #     level issue in compute_ase() itself, not a window definition issue.
+  extended_no_window_diag <- df %>%
+    filter(patient_group == "sepsis_extended",
+           lactate_ordered_in_window == 0) %>%
+    mutate(
+      likely_cause = if_else(
+        any_lactate_ordered_whole_hospitalization == 1,
+        "window_boundary_mismatch_lactate_drawn_elsewhere_in_hosp",
+        "no_lactate_order_in_hospitalization_at_all_check_compute_ase"
+      )
+    ) %>%
+    select(hospitalization_id, hospital_id, year,
+           any_lactate_ordered_whole_hospitalization,
+           lactate_ordered_in_window, likely_cause)
+
+  cat("\nBreakdown of sepsis_extended/no-window-lactate cases by likely cause:\n")
+  print(table(extended_no_window_diag$likely_cause))
+
+  # Local-only export — hospitalization_id is a site-internal identifier and
+  # is not exported to the CC. Site staff use this file to manually review
+  # the flagged hospitalizations against source EHR data before escalating
+  # to the pipeline team.
+  write_csv(extended_no_window_diag,
+            file.path(OUTPUT_DIR, "diagnostics",
+                 paste0(SITE_ID, "_02b_extended_no_window_lactate_LOCAL_ONLY.csv")))
+  cat("Diagnostic export written (LOCAL ONLY — do not share with CC):\n",
+      file.path(OUTPUT_DIR, "diagnostics",
+           paste0(SITE_ID, "_02b_extended_no_window_lactate_LOCAL_ONLY.csv")), "\n")
+
+} else {
+  cat("ASE flag check PASSED: all sepsis_extended patients have window lactate draw.\n")
+}
+
+# Mechanism stratification summary — no_sepsis subgroups
+mech_summary <- df %>%
+  filter(patient_group == "no_sepsis") %>%
+  count(lactate_ordered_in_window) %>%
+  mutate(
+    subgroup = case_when(
+      lactate_ordered_in_window == 0 ~ "Structural non-observability (lactate not drawn in window)",
+      lactate_ordered_in_window == 1 ~ "True negative opportunity (lactate drawn, criterion not met)"
+    ),
+    pct = round(n / sum(n) * 100, 1)
+  ) %>%
+  select(subgroup, n, pct)
+
+cat("\nno_sepsis mechanism breakdown:\n")
+kable(mech_summary,
+      caption = paste0(
+        "no_sepsis patients stratified by window lactate observability. ",
+        "Structural non-observability = lactate criterion could never have ",
+        "been triggered. True negative = lactate drawn but result did not ",
+        "meet criterion."
+      ))
+
+# Overlap diagnostic: sepsis_core patients with window lactate (both pathways)
+n_core_with_window_lactate <- df %>%
+  filter(patient_group == "sepsis_core",
+         lactate_ordered_in_window == 1) %>%
+  nrow()
+
+n_core_total <- sum(df$patient_group == "sepsis_core")
+
+cat(paste0(
+  "\nsepsis_core overlap check: ",
+  n_core_with_window_lactate, " of ", n_core_total,
+  " (", round(n_core_with_window_lactate / n_core_total * 100, 1), "%)",
+  " core patients also had lactate drawn in window",
+  " — these are the Section 4c overlap group candidates.\n"
+))
+
+# 2.5 Collinearity diagnostic: lactate volume vs year ──────────────────────────
+# Computed at hospital-year level (one observation per hospital-year).
+# Patient-level computation inflates N artificially — every patient in a
+# hospital-year shares the same lactate_order value, so the effective N
+# is the number of distinct hospital-year combinations, not hospitalizations.
+cor_lactate_year_data <- df %>%
+  distinct(hospital_id, year, lactate_order_per_1000_patient_days) %>%
+  filter(!is.na(lactate_order_per_1000_patient_days))
+
+cor_lactate_year <- cor(cor_lactate_year_data$lactate_order_per_1000_patient_days,
+                        cor_lactate_year_data$year)
+
+cat(paste("\nPearson r (lactate_order_per_1000_patient_days ~ year, hospital-year level):",
           round(cor_lactate_year, 3), "\n"))
+cat(paste("N hospital-year obs used for r:", nrow(cor_lactate_year_data), "\n"))
 if (abs(cor_lactate_year) > 0.7)
   warning("r > 0.7 — strong collinearity. Review SA3 (centered lactate) carefully.")
 
-# 2.5 Hospital count and modeling path ─────────────────────────────────────────
+# 2.6 Hospital count and modeling path ─────────────────────────────────────────
 n_hospitals      <- n_distinct(df$hospital_id)
 re_structure     <- ifelse(n_hospitals >= 2, "glmer_re",            "glm_clustered_se")
 model_path       <- ifelse(n_hospitals >= 2, "glmer",               "glm")
@@ -397,7 +636,7 @@ cat(paste("Number of hospitals:", n_hospitals, "\n"))
 cat(paste("Modeling path:", re_structure, "\n"))
 cat(paste("Interaction type:", interaction_type, "\n"))
 
-# 2.6 Within-year centering for SA3 ───────────────────────────────────────────
+# 2.7 Within-year centering for SA3 ───────────────────────────────────────────
 if (n_hospitals >= 2) {
   hospital_year_stats <- df %>%
     distinct(hospital_id, year, lactate_order_per_1000_patient_days) %>%
@@ -433,7 +672,7 @@ if (n_missing_centered > 0)
 
 cat(paste("Centering method:", centering_method, "\n"))
 
-# 2.7 Hospital de-identification ───────────────────────────────────────────────
+# 2.8 Hospital de-identification ───────────────────────────────────────────────
 hosp_crosswalk <- df %>%
   distinct(hospital_id) %>%
   arrange(hospital_id) %>%
@@ -445,6 +684,67 @@ cat("DO NOT share hospital identity mapping with the coordinating center.\n")
 
 df <- df %>% left_join(hosp_crosswalk, by = "hospital_id")
 cat(paste("De-identified IDs assigned:", n_distinct(df$hospital_id_deident), "hospitals\n"))
+```
+
+```{r hosp-year-crosstab}
+# 2.9 Patient group composition by hospital-year ───────────────────────────────
+# Cross-tabulates patient_group against hospital × year to detect anomalous
+# group distributions that could signal phenotyping artifacts or data quality
+# issues specific to a hospital or time period.
+#
+# Flag: hospital-years where sepsis_extended proportion exceeds 50% of all
+# ASE-positive patients are unexpected — the lactate-only marginal group
+# should be a minority of total ASE by design. Proportions this high may
+# indicate upstream phenotyping issues at that hospital-year.
+
+hosp_year_group_crosstab <- df %>%
+  count(hospital_id_deident, year, patient_group) %>%
+  group_by(hospital_id_deident, year) %>%
+  mutate(
+    total_hosp_year = sum(n),
+    pct             = round(n / total_hosp_year * 100, 1)
+  ) %>%
+  ungroup() %>%
+  pivot_wider(
+    id_cols      = c(hospital_id_deident, year, total_hosp_year),
+    names_from   = patient_group,
+    values_from  = c(n, pct),
+    values_fill  = 0
+  ) %>%
+  arrange(hospital_id_deident, year)
+
+kable(hosp_year_group_crosstab,
+      caption = paste0(
+        "Patient group composition by hospital-year. ",
+        "sepsis_extended proportion > 50% of total ASE-positive patients ",
+        "is flagged as anomalous."
+      ))
+
+# Flag anomalous hospital-years
+n_ase_hosp_year <- df %>%
+  filter(patient_group != "no_sepsis") %>%
+  count(hospital_id_deident, year, patient_group) %>%
+  group_by(hospital_id_deident, year) %>%
+  mutate(pct_of_ase = n / sum(n) * 100) %>%
+  ungroup()
+
+flagged_hosp_years <- n_ase_hosp_year %>%
+  filter(patient_group == "sepsis_extended", pct_of_ase > 50)
+
+if (nrow(flagged_hosp_years) > 0) {
+  warning(nrow(flagged_hosp_years),
+          " hospital-year(s) have sepsis_extended > 50% of total ASE. ",
+          "Review upstream phenotyping for these hospital-years.")
+  cat("\nFlagged hospital-years:\n")
+  print(flagged_hosp_years)
+} else {
+  cat("Hospital-year group composition check PASSED: no anomalous sepsis_extended proportions.\n")
+}
+
+# Export
+write_csv(hosp_year_group_crosstab,
+          file.path(OUTPUT_DIR, "diagnostics",
+               paste0(SITE_ID, "_04_patient_group_hosp_year_crosstab.csv")))
 ```
 
 ---
@@ -514,13 +814,38 @@ group_clinical <- df %>%
   filter(patient_group %in% c("sepsis_core", "sepsis_extended")) %>%
   group_by(patient_group) %>%
   summarise(
-    n            = n(),
-    median_age   = median(age,  na.rm = TRUE),
-    pct_female   = round(mean(sex == "Female", na.rm = TRUE) * 100, 1),
-    median_cci   = median(cci,  na.rm = TRUE),
-    median_sofa  = median(worst_sofa_admission_to_24h, na.rm = TRUE),
-    pct_academic = round(mean(hospital_type == "academic", na.rm = TRUE) * 100, 1),
-    .groups      = "drop"
+    n                    = n(),
+    median_age           = median(age, na.rm = TRUE),
+    pct_female           = round(mean(sex == "Female", na.rm = TRUE) * 100, 1),
+    median_cci           = median(cci, na.rm = TRUE),
+    median_sofa_24h      = median(worst_sofa_admission_to_24h, na.rm = TRUE),
+    pct_academic         = round(mean(hospital_type == "academic", na.rm = TRUE) * 100, 1),
+    # Race/ethnicity — model levels
+    pct_nh_white         = round(mean(race_eth_model == "NH_White",  na.rm = TRUE) * 100, 1),
+    pct_nh_black         = round(mean(race_eth_model == "NH_Black",  na.rm = TRUE) * 100, 1),
+    pct_hispanic         = round(mean(race_eth_model == "Hispanic",  na.rm = TRUE) * 100, 1),
+    # Descriptive only — NH_Asian and NH_Other excluded from adjusted models
+    # for cross-site consistency; reported here for Table 1
+    pct_nh_asian         = round(mean(!is.na(race_category) &
+                                        tolower(ethnicity_category) %in%
+                                          c("non-hispanic", "not hispanic") &
+                                        tolower(race_category) == "asian",
+                                      na.rm = TRUE) * 100, 1),
+    pct_nh_other         = round(mean(!is.na(race_category) &
+                                        tolower(ethnicity_category) %in%
+                                          c("non-hispanic", "not hispanic") &
+                                        !tolower(race_category) %in%
+                                          c("white", "black or african american",
+                                            "black", "african american",
+                                            "black or african-american", "asian",
+                                            "unknown", "not reported", "nan"),
+                                      na.rm = TRUE) * 100, 1),
+    pct_race_eth_missing = round(mean(is.na(race_eth_model)) * 100, 1),
+    median_hospital_los  = median(hospital_los_days, na.rm = TRUE),
+    pct_had_icu          = round(mean(had_icu == 1, na.rm = TRUE) * 100, 1),
+    median_icu_los       = median(icu_los_days[had_icu == 1], na.rm = TRUE),
+    pct_in_hosp_death    = round(mean(in_hospital_death == 1, na.rm = TRUE) * 100, 1),
+    .groups              = "drop"
   )
 
 kable(group_clinical, caption = "Clinical profile by patient group (sepsis cases only)")
@@ -687,7 +1012,7 @@ if (nrow(group_clinical) == 2) {
     mutate(patient_group = factor(patient_group,
                                   levels = c("sepsis_core", "sepsis_extended"),
                                   labels = c("Core Sepsis", "Extended Only"))) %>%
-    select(patient_group, median_age, pct_female, median_cci, median_sofa) %>%
+    select(patient_group, median_age, pct_female, median_cci, median_sofa_24h) %>%
     pivot_longer(-patient_group, names_to = "variable", values_to = "value") %>%
     mutate(variable = recode(variable,
                              "median_age"  = "Median Age (years)",
@@ -746,7 +1071,7 @@ cat(paste("Year centering offset:", year_center, "\n"))
 
 # 4.2 Zero-variance covariate check
 zero_var_covariates <- c("worst_sofa_admission_to_24h", "age", "sex", "cci",
-                         "hospital_type", "year_centered",
+                         "race_eth_model", "hospital_type", "year_centered",
                          "hospitalizations_from_ed_per_year") %>%
   purrr::keep(~ {
     col <- df_model[[.x]]
@@ -763,7 +1088,8 @@ if (length(zero_var_covariates) > 0) {
 
 covariate_terms <- setdiff(
   c("worst_sofa_admission_to_24h", "age", "sex", "cci",
-    "hospital_type", "year_centered", "hospitalizations_from_ed_per_year"),
+    "race_eth_model", "hospital_type", "year_centered",
+    "hospitalizations_from_ed_per_year"),
   zero_var_covariates
 )
 
@@ -861,7 +1187,9 @@ if (!is.null(contrast_primary)) {
       model_version      = re_structure,
       n_hospitals        = n_hospitals,
       n_hospitalizations = nrow(df_model),
-      blup_available     = (model_path == "glmer")
+      blup_available     = (model_path == "glmer"),
+      convergence_warn_a = !is.null(warn_primary_a),
+      convergence_warn_b = !is.null(warn_primary_b)
     )
   cat("\nPrimary contrast (Model B minus Model A lactate coefficient):\n")
   kable(contrast_primary, digits = 4,
@@ -957,19 +1285,246 @@ print(re_var_primary)
 
 ---
 
+# Section 4b — Alternative Contrast: Non-Mutually-Exclusive Extended Framing
+
+```{r alt-framing-check}
+# ─────────────────────────────────────────────────────────────────────────────
+# This section fits an alternative Model B to produce a directionality check
+# on the primary contrast estimand.
+#
+# PRIMARY framing (Section 4):
+#   Model A: sepsis_core      vs no_sepsis  (positive group = ASE_def_0==1)
+#   Model B: sepsis_extended  vs no_sepsis  (positive group = lactate-only marginal,
+#                                            ASE_def_0==0 AND ASE_def_1==1)
+#   Contrast = Beta_B - Beta_A
+#   Answers: does lactate ordering intensity predict reclassification into
+#            the marginal lactate-only group?
+#
+# ALTERNATIVE framing (this section):
+#   Model A: identical to primary — no refitting needed; reuses model_a / vcov_a
+#   Model B: ASE_def_1==1 vs no_sepsis (positive group = sepsis_core + sepsis_extended,
+#            i.e., everyone meeting the 6-criterion extended definition)
+#   Contrast = Beta_B_alt - Beta_A
+#   Answers: does lactate ordering intensity widen the overall gap between the
+#            extended and core definitions? (policy-level question)
+#
+# Comparing the two contrasts reveals whether the direction is stable across
+# how the extended group is bounded. If both are the same sign, the directional
+# finding is not sensitive to the mutual-exclusivity assumption. If they diverge,
+# the marginal lactate-only cases are driving a different signal than the
+# combined extended population.
+# ─────────────────────────────────────────────────────────────────────────────
+
+cat("Fitting alternative Model B: ASE_def_1==1 (sepsis_core + sepsis_extended) vs no_sepsis\n")
+cat("Model A reused from Section 4 without refitting.\n\n")
+
+# Full analytic cohort; outcome = 1 for anyone meeting the 6-criterion definition
+df_model_b_alt <- df_model %>%
+  mutate(outcome_b_alt = as.integer(patient_group != "no_sepsis"))
+
+cat(paste("Alternative Model B: n =", nrow(df_model_b_alt), "hospitalizations\n"))
+cat(paste("  Positive (sepsis_core + sepsis_extended): n =",
+          sum(df_model_b_alt$outcome_b_alt), "\n"))
+cat(paste("  Negative (no_sepsis): n =",
+          sum(df_model_b_alt$outcome_b_alt == 0), "\n"))
+
+formula_model_b_alt <- reformulate(fixed_rhs, response = "outcome_b_alt")
+
+warn_alt_b  <- NULL
+model_b_alt <- fit_binary(formula_model_b_alt, df_model_b_alt, model_path,
+                           warn_var = "warn_alt_b")
+
+cat(paste("Alternative Model B fit:", ifelse(is.null(model_b_alt), "FAILED", "OK"), "\n"))
+
+vcov_b_alt     <- if (!is.null(model_b_alt))
+  get_model_vcov(model_b_alt, model_path, df_model_b_alt) else NULL
+coef_b_alt_raw <- tidy_binary(model_b_alt, vcov_b_alt)
+
+coef_b_alt <- if (!is.null(coef_b_alt_raw))
+  add_metadata(
+    coef_df             = coef_b_alt_raw,
+    model_version       = paste0(re_structure, "_alt_model_b_extended_def1_vs_nosepsis"),
+    site_id             = SITE_ID,
+    n_hospitals         = n_hospitals,
+    n_hospitalizations  = nrow(df_model_b_alt),
+    lactate_center      = lactate_center,
+    lactate_scale       = lactate_scale,
+    year_center         = year_center,
+    centering_method    = centering_method,
+    zero_var_covariates = zero_var_covariates,
+    warn_a              = warn_primary_a,
+    warn_b              = warn_alt_b
+  )
+
+# Alternative contrast — reuses vcov_a from Section 4 (no new variance needed for Model A)
+contrast_alt <- compute_contrast(coef_a_raw, coef_b_alt_raw, vcov_a, vcov_b_alt)
+
+if (!is.null(contrast_alt)) {
+  contrast_alt <- contrast_alt %>%
+    mutate(
+      site_id            = SITE_ID,
+      model_version      = paste0(re_structure, "_alt_extended_def1_vs_nosepsis"),
+      n_hospitals        = n_hospitals,
+      n_hospitalizations = nrow(df_model_b_alt),
+      blup_available     = (model_path == "glmer"),
+      convergence_warn_a = !is.null(warn_primary_a),
+      convergence_warn_b = !is.null(warn_alt_b),
+      framing            = "non_mutually_exclusive_extended_def1"
+    )
+}
+
+# Alternative Model B lactate coefficient
+if (!is.null(coef_b_alt)) {
+  cat("\nAlternative Model B — lactate_vol_scaled coefficient:\n")
+  kable(
+    coef_b_alt %>%
+      filter(term == "lactate_vol_scaled") %>%
+      select(term, estimate, std.error, statistic, p.value, conf.low, conf.high),
+    digits  = 4,
+    caption = "Alternative Model B (ASE_def_1==1 vs no_sepsis) — lactate coefficient (log-OR scale)"
+  )
+}
+
+# Side-by-side directionality check
+if (!is.null(contrast_primary) && !is.null(contrast_alt)) {
+  contrast_comparison <- bind_rows(
+    contrast_primary %>%
+      select(contrast_estimate, contrast_se, contrast_ci_low, contrast_ci_high,
+             contrast_p, lactate_coef_model_a, lactate_coef_model_b) %>%
+      mutate(framing = "primary: lactate-only (sepsis_extended) vs no_sepsis",
+             .before = 1),
+    contrast_alt %>%
+      select(contrast_estimate, contrast_se, contrast_ci_low, contrast_ci_high,
+             contrast_p, lactate_coef_model_a, lactate_coef_model_b) %>%
+      mutate(framing = "alternative: all extended (ASE_def_1==1) vs no_sepsis",
+             .before = 1)
+  )
+
+  cat("\nPrimary vs alternative contrast — directionality check:\n")
+  kable(
+    contrast_comparison,
+    digits  = 4,
+    caption = paste0(
+      "Directionality check: consistent sign across both framings indicates the ",
+      "direction is not driven by how the extended group is bounded. ",
+      "Divergence in sign or magnitude indicates the lactate-only marginal cases ",
+      "behave differently from the combined extended population with respect to ",
+      "lactate ordering intensity."
+    )
+  )
+} else {
+  warning("Directionality check skipped — one or both contrasts unavailable.")
+}
+
+# Figure: framing comparison — coefficient panel + contrast forest panel ──────
+fig_framing_comparison <- NULL
+
+if (!is.null(contrast_primary) && !is.null(contrast_alt) &&
+    !is.null(coef_a_raw) && !is.null(coef_b_raw) && !is.null(coef_b_alt_raw)) {
+
+  # Panel A data: Model A and Model B lactate coefficients under each framing.
+  # Model A is identical across both framings (no refit) — shown once per
+  # framing row for visual symmetry with Model B, which does differ.
+  panel_a_data <- bind_rows(
+    coef_a_raw %>%
+      filter(term == "lactate_vol_scaled") %>%
+      mutate(framing = "Primary",     model = "Model A (sepsis_core)"),
+    coef_b_raw %>%
+      filter(term == "lactate_vol_scaled") %>%
+      mutate(framing = "Primary",     model = "Model B (sepsis_extended)"),
+    coef_a_raw %>%
+      filter(term == "lactate_vol_scaled") %>%
+      mutate(framing = "Alternative", model = "Model A (sepsis_core)"),
+    coef_b_alt_raw %>%
+      filter(term == "lactate_vol_scaled") %>%
+      mutate(framing = "Alternative", model = "Model B (ASE_def_1==1)")
+  ) %>%
+    mutate(
+      framing = factor(framing, levels = c("Primary", "Alternative")),
+      # Reverse levels so Model A (anchor) appears at top of y-axis
+    model   = factor(model, levels = c("Model B (ASE_def_1==1)",
+                                          "Model B (sepsis_extended)",
+                                          "Model A (sepsis_core)"))
+    )
+
+  panel_a <- ggplot(panel_a_data,
+                     aes(x = estimate, y = model, color = framing)) +
+    geom_vline(xintercept = 0, linetype = "dashed", color = "grey50") +
+    geom_pointrange(
+      aes(xmin = estimate - 1.96 * std.error,
+          xmax = estimate + 1.96 * std.error),
+      position = position_dodge(width = 0.4), size = 0.6
+    ) +
+    labs(
+      title = "Model-level lactate coefficients by framing",
+      x     = "Log-OR (lactate ordering intensity)",
+      y     = NULL,
+      color = "Framing"
+    ) +
+    theme_minimal(base_size = 11) +
+    theme(legend.position = "top")
+
+  # Panel B: contrast forest — primary vs alternative
+  panel_b_data <- contrast_comparison %>%
+    mutate(
+      framing_short = if_else(str_detect(framing, "^primary"),
+                               "Primary\n(lactate-only vs no_sepsis)",
+                               "Alternative\n(all extended vs no_sepsis)"),
+      framing_short = factor(framing_short,
+                              levels = c("Alternative\n(all extended vs no_sepsis)",
+                                         "Primary\n(lactate-only vs no_sepsis)"))
+    )
+
+  panel_b <- ggplot(panel_b_data,
+                     aes(x = contrast_estimate, y = framing_short)) +
+    geom_vline(xintercept = 0, linetype = "dashed", color = "grey50") +
+    geom_pointrange(
+      aes(xmin = contrast_ci_low, xmax = contrast_ci_high),
+      size = 0.7, color = "black"
+    ) +
+    labs(
+      title = "Cross-model contrast (β_B − β_A)",
+      x     = "Contrast estimate, log-OR scale (95% CI)",
+      y     = NULL
+    ) +
+    theme_minimal(base_size = 11)
+
+  fig_framing_comparison <- panel_a / panel_b +
+    plot_annotation(
+      title    = paste0(SITE_ID, ": Primary vs alternative extended-definition framing"),
+      subtitle = "Consistent sign across framings = directional stability. Magnitude attenuation in alternative framing reflects sepsis_core dilution."
+    )
+
+  ggsave(file.path(OUTPUT_DIR, "figures",
+                    paste0(SITE_ID, "_fig5_framing_comparison.png")),
+         plot = fig_framing_comparison, width = 10, height = 7, dpi = 300)
+
+  fig_framing_comparison
+} else {
+  warning("fig_framing_comparison skipped — one or more required model objects unavailable.")
+}
+```
+
+
+---
+
 # Section 5 — Sensitivity Analyses
 
 ```{r sensitivity-sa1}
-# SA1: Restrict to encounters with any lactate ordered ─────────────────────────
-cat("Fitting SA1: restrict to encounters with any lactate ordered\n")
+# SA1: Restrict to encounters with lactate ordered in the ASE window ────────────
+# Uses lactate_ordered_in_window (±2 days of blood-culture-anchored window),
+# replacing any_lactate_ordered_whole_hospitalization which captured draws at
+# any point during the admission. Window-specific flag more precisely identifies
+# hospitalizations where the lactate criterion was structurally observable.
+cat("Fitting SA1: restrict to lactate ordered in ASE window (window-specific)\n")
 
 df_sa1_a <- df_model %>%
-  filter(any_lactate_ordered == 1,
+  filter(lactate_ordered_in_window == 1,
          patient_group %in% c("no_sepsis", "sepsis_core")) %>%
   mutate(outcome_a = as.integer(patient_group == "sepsis_core"))
 
 df_sa1_b <- df_model %>%
-  filter(any_lactate_ordered == 1,
+  filter(lactate_ordered_in_window == 1,
          patient_group %in% c("no_sepsis", "sepsis_extended")) %>%
   mutate(outcome_b = as.integer(patient_group == "sepsis_extended"))
 
@@ -1222,6 +1777,86 @@ if (!is.null(contrast_sa3))
   kable(contrast_sa3, digits = 4, caption = "SA3 — primary contrast")
 ```
 
+```{r sensitivity-sa4}
+# SA4: SOFA-dropped sensitivity ─────────────────────────────────────────────────
+# Rationale: sepsis_extended patients have elevated lactate as their sole organ
+# dysfunction criterion, so SOFA in the first 24h is structurally low for this
+# group by construction. Including SOFA as a covariate in Model B may over-adjust
+# by absorbing legitimate variation in the outcome. SA4 refits both models without
+# worst_sofa_admission_to_24h and computes the contrast to assess whether the
+# primary finding is sensitive to this potential over-adjustment.
+cat("Fitting SA4: SOFA-dropped sensitivity\n")
+
+covariate_terms_sa4 <- setdiff(covariate_terms, "worst_sofa_admission_to_24h")
+
+if ("worst_sofa_admission_to_24h" %in% covariate_terms) {
+  cat(paste("SA4: dropping worst_sofa_admission_to_24h. Remaining:",
+            paste(covariate_terms_sa4, collapse = ", "), "\n"))
+} else {
+  cat("SA4: worst_sofa_admission_to_24h already excluded — SA4 identical to primary.\n")
+}
+
+# Same datasets as primary; only the formula changes
+formula_sa4_a <- reformulate(
+  c("lactate_vol_scaled", covariate_terms_sa4,
+    if (model_path == "glmer") "(1 | hospital_id_deident)" else NULL),
+  response = "outcome_a")
+formula_sa4_b <- reformulate(
+  c("lactate_vol_scaled", covariate_terms_sa4,
+    if (model_path == "glmer") "(1 | hospital_id_deident)" else NULL),
+  response = "outcome_b")
+
+warn_sa4_a <- NULL; warn_sa4_b <- NULL
+model_sa4_a <- fit_binary(formula_sa4_a, df_model_a, model_path, "warn_sa4_a")
+model_sa4_b <- fit_binary(formula_sa4_b, df_model_b, model_path, "warn_sa4_b")
+
+vcov_sa4_a <- if (!is.null(model_sa4_a)) get_model_vcov(model_sa4_a, model_path, df_model_a) else NULL
+vcov_sa4_b <- if (!is.null(model_sa4_b)) get_model_vcov(model_sa4_b, model_path, df_model_b) else NULL
+
+coef_sa4_a_raw <- tidy_binary(model_sa4_a, vcov_sa4_a)
+coef_sa4_b_raw <- tidy_binary(model_sa4_b, vcov_sa4_b)
+
+coef_sa4 <- bind_rows(
+  if (!is.null(coef_sa4_a_raw)) coef_sa4_a_raw %>%
+    mutate(model_label    = "model_a",
+           model_version  = paste0(re_structure, "_sa4_sofa_dropped_model_a"),
+           site_id        = SITE_ID,
+           convergence_warn = !is.null(warn_sa4_a)),
+  if (!is.null(coef_sa4_b_raw)) coef_sa4_b_raw %>%
+    mutate(model_label    = "model_b",
+           model_version  = paste0(re_structure, "_sa4_sofa_dropped_model_b"),
+           site_id        = SITE_ID,
+           convergence_warn = !is.null(warn_sa4_b))
+)
+
+contrast_sa4 <- compute_contrast(coef_sa4_a_raw, coef_sa4_b_raw, vcov_sa4_a, vcov_sa4_b)
+if (!is.null(contrast_sa4))
+  contrast_sa4 <- contrast_sa4 %>%
+    mutate(
+      site_id              = SITE_ID,
+      model_version        = paste0(re_structure, "_sa4_sofa_dropped"),
+      n_hospitals          = n_hospitals,
+      n_hospitalizations   = nrow(df_model),
+      blup_available       = (model_path == "glmer"),
+      convergence_warn_a   = !is.null(warn_sa4_a),
+      convergence_warn_b   = !is.null(warn_sa4_b),
+      sensitivity_analysis = "SA4_sofa_dropped"
+    )
+
+re_var_sa4 <- bind_rows(
+  extract_re_variance(model_sa4_a, "model_a_core_vs_nosepsis_sa4",     model_path, SITE_ID),
+  extract_re_variance(model_sa4_b, "model_b_extended_vs_nosepsis_sa4", model_path, SITE_ID)
+)
+
+cat("SA4 complete.\n")
+if (nrow(coef_sa4) > 0)
+  kable(coef_sa4 %>% filter(grepl("lactate", term)) %>%
+          select(model_label, term, estimate, std.error, p.value, conf.low, conf.high),
+        digits = 4, caption = "SA4 — lactate terms by model (SOFA dropped)")
+if (!is.null(contrast_sa4))
+  kable(contrast_sa4, digits = 4, caption = "SA4 — primary contrast (SOFA dropped)")
+```
+
 ---
 
 # Section 6 — Output Assembly & Export
@@ -1267,10 +1902,16 @@ output_list <- list(
   re_var_sa2a          = re_var_sa2a,
   re_var_sa2b          = re_var_sa2b,
   re_var_sa3           = re_var_sa3,
+  coef_b_alt           = coef_b_alt,
+  contrast_alt         = contrast_alt,
+  coef_sa4             = coef_sa4,
+  contrast_sa4         = contrast_sa4,
+  re_var_sa4           = re_var_sa4,
   fig_lactate_trend    = fig_lactate_trend,
   fig_ase_gap          = fig_ase_gap,
   fig_group_dist       = fig_group_dist,
-  fig_clinical_profile = fig_clinical_profile
+  fig_clinical_profile = fig_clinical_profile,
+  fig_framing_comparison = fig_framing_comparison
 )
 
 # 6.2 Export CSVs
@@ -1344,6 +1985,20 @@ write_if(re_var_sa2b,
 write_if(re_var_sa3,
          file.path(OUTPUT_DIR, "models", paste0(SITE_ID, "_25_re_variance_sa3.csv")))
 
+# Alternative framing exports (Section 4b)
+write_if(coef_b_alt,
+         file.path(OUTPUT_DIR, "models", paste0(SITE_ID, "_26_alt_model_b_extended_def1_coefs.csv")))
+write_if(contrast_alt,
+         file.path(OUTPUT_DIR, "models", paste0(SITE_ID, "_27_alt_extended_def1_contrast.csv")))
+
+# SA4 exports (SOFA-dropped sensitivity)
+write_if(coef_sa4,
+         file.path(OUTPUT_DIR, "models", paste0(SITE_ID, "_28_sa4_sofa_dropped_coefs.csv")))
+write_if(contrast_sa4,
+         file.path(OUTPUT_DIR, "models", paste0(SITE_ID, "_29_sa4_sofa_dropped_contrast.csv")))
+write_if(re_var_sa4,
+         file.path(OUTPUT_DIR, "models", paste0(SITE_ID, "_30_re_variance_sa4.csv")))
+
 cat("CSV exports complete.\n")
 
 # 6.3 RDS + JSON
@@ -1353,7 +2008,8 @@ saveRDS(output_list,
 
 output_json <- output_list
 output_json[c("fig_lactate_trend", "fig_ase_gap",
-              "fig_group_dist", "fig_clinical_profile")] <- NULL
+              "fig_group_dist", "fig_clinical_profile",
+              "fig_framing_comparison")] <- NULL
 output_json$vcov_model_a <- if (!is.null(vcov_a)) as.data.frame(vcov_a) else NULL
 output_json$vcov_model_b <- if (!is.null(vcov_b)) as.data.frame(vcov_b) else NULL
 
@@ -1388,6 +2044,7 @@ The following files have been saved to the `<output_directory>/` directory (as c
 - `<output_directory>/diagnostics/[SITE]_01_baseline_completeness.csv`
 - `<output_directory>/diagnostics/[SITE]_02_patient_group_qc.csv`
 - `<output_directory>/diagnostics/[SITE]_03_cor_lactate_year.csv`
+- `<output_directory>/diagnostics/[SITE]_04_patient_group_hosp_year_crosstab.csv` — patient group n and % by hospital × year
 - `<output_directory>/diagnostics/[SITE]_session_info.txt`
 
 **Tables (return all):**
@@ -1420,6 +2077,11 @@ The following files have been saved to the `<output_directory>/` directory (as c
 - `<output_directory>/models/[SITE]_23_re_variance_sa2a.csv` — RE variance, SA2a (exclude COVID years)
 - `<output_directory>/models/[SITE]_24_re_variance_sa2b.csv` — RE variance, SA2b (year-stratified, one row per year per model)
 - `<output_directory>/models/[SITE]_25_re_variance_sa3.csv` — RE variance, SA3 (centered lactate)
+- `<output_directory>/models/[SITE]_26_alt_model_b_extended_def1_coefs.csv` — alternative Model B coefficients (ASE_def_1==1 vs no_sepsis)
+- `<output_directory>/models/[SITE]_27_alt_extended_def1_contrast.csv` — alternative contrast; compare sign/magnitude to 09 ⭐
+- `<output_directory>/models/[SITE]_28_sa4_sofa_dropped_coefs.csv` — SA4 Model A + B coefficients (SOFA dropped)
+- `<output_directory>/models/[SITE]_29_sa4_sofa_dropped_contrast.csv` — SA4 contrast; compare to primary to assess SOFA over-adjustment ⭐
+- `<output_directory>/models/[SITE]_30_re_variance_sa4.csv` — RE variance, SA4
 - `<output_directory>/models/[SITE]_ASE_results.rds` — full output bundle ⭐
 - `<output_directory>/models/[SITE]_ASE_results.json`
 
@@ -1429,7 +2091,9 @@ The following files have been saved to the `<output_directory>/` directory (as c
 - `<output_directory>/figures/[SITE]_fig2_ase_rate_gap.png`
 - `<output_directory>/figures/[SITE]_fig3_patient_group_distribution.png`
 - `<output_directory>/figures/[SITE]_fig4_clinical_profile.png`
+- `<output_directory>/figures/[SITE]_fig5_framing_comparison.png` — primary vs alternative (§4b) framing comparison, model coefficients + contrast forest
 
 **Do NOT share (local only):**
 
 - Hospital de-identification crosswalk (printed to console only)
+- `<output_directory>/diagnostics/[SITE]_02b_extended_no_window_lactate_LOCAL_ONLY.csv` — contains hospitalization_id; for internal review only, only generated if n_extended_no_window > 0

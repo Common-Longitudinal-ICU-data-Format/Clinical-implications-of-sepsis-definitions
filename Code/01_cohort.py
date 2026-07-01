@@ -17,25 +17,41 @@ def _(mo):
 
     This notebook builds the cohort for the sepsis definitions comparison study (ASE with/without lactate vs BSE).
 
-    ## Inclusion Criteria
+    ## Encounter stitching
+    Related hospitalizations of the same patient within a 6-hour window
+    (discharge -> next admission) are stitched into a single **encounter_block**
+    (clifpy `stitch_encounters`). The stitched encounter becomes the unit of
+    analysis everywhere; its id is stored in the `hospitalization_id` column as
+    `EB<n>`.
+
+    ## Inclusion Criteria (applied per stitched encounter)
     - Adult hospitalized patients aged 18 years or older
     - Admitted 2018-2024
     - Admitted via the ED
     - Admitted to academic or community hospitals (excluding LTACH)
-    - Must have ED location during hospitalization
+    - Must have an ED location during the encounter
+    - Must have an ED **and** a ward or ICU location during the encounter
+      (i.e. a true ED -> inpatient admission, not an ED-only visit)
     """)
     return
 
 
 @app.cell
 def _():
+    import sys
     import json
     import pandas as pd
     import polars as pl
     from pathlib import Path
+
+    # Make the local stitch_utils helper importable when run as `python Code/01_cohort.py`
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import stitch_utils as su
+
     from clifpy.tables import Patient, Hospitalization, Adt, Labs, HospitalDiagnosis
     from clifpy.utils.comorbidity import calculate_cci
     from clifpy.utils.sofa_polars import compute_sofa_polars
+    from clifpy.utils.stitching_encounters import stitch_encounters
     return (
         Adt,
         HospitalDiagnosis,
@@ -48,6 +64,8 @@ def _():
         json,
         pd,
         pl,
+        stitch_encounters,
+        su,
     )
 
 
@@ -64,6 +82,7 @@ def _(Path, json):
     OUTPUT_DIR = Path(config["output_directory"])
     PHI_DIR = Path(config["phi_directory"])
     SITE_NAME = config["site_name"]
+    STITCH_HOURS = int(config.get("stitch_time_interval_hours", 6))
 
     # Create both output directories
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -73,7 +92,8 @@ def _(Path, json):
     print(f"Data directory: {DATA_DIR}")
     print(f"Filetype: {FILETYPE}")
     print(f"Timezone: {TIMEZONE}")
-    return DATA_DIR, FILETYPE, OUTPUT_DIR, PHI_DIR, TIMEZONE
+    print(f"Stitch window: {STITCH_HOURS}h")
+    return DATA_DIR, FILETYPE, OUTPUT_DIR, PHI_DIR, STITCH_HOURS, TIMEZONE
 
 
 @app.cell
@@ -114,26 +134,66 @@ def _(Adt, DATA_DIR, FILETYPE, Hospitalization, Patient, TIMEZONE):
 @app.cell
 def _(mo):
     mo.md(r"""
+    ## Step 1b: Stitch Encounters (6-hour window)
+
+    Link hospitalizations of the same patient whose gap (prior discharge ->
+    next admission) is <= 6 hours into a single `encounter_block`. We then build
+    a block-level hospitalization table (one row per encounter) and a stitched
+    ADT (events re-keyed to the encounter id). The mapping is saved for the
+    downstream notebooks.
+    """)
+    return
+
+
+@app.cell
+def _(PHI_DIR, STITCH_HOURS, adt, hospitalization, stitch_encounters, su):
+    # Stitch encounters on the FULL hospitalization + adt tables.
+    _hosp_stitched, _adt_stitched, encounter_mapping = stitch_encounters(
+        hospitalization.df,
+        adt.df,
+        time_interval=STITCH_HOURS,
+    )
+
+    # Persist the mapping (hospitalization_id -> encounter_block) for notebooks 2/3
+    encounter_mapping.to_parquet(PHI_DIR / "encounter_mapping.parquet", index=False)
+
+    # Block-level hospitalization (one row per encounter_block, ids => EB<n>)
+    block_hosp = su.build_block_hospitalization(hospitalization.df, encounter_mapping)
+
+    # ADT re-keyed to the stitched encounter id (all rows kept)
+    adt_stitched = su.remap_ids(adt.df, encounter_mapping)
+
+    _n_hosp = encounter_mapping["hospitalization_id"].nunique()
+    _n_block = encounter_mapping["encounter_block"].nunique()
+    print(f"Stitched {_n_hosp:,} hospitalizations -> {_n_block:,} encounter blocks")
+    print(f"  Collapse ratio: {_n_hosp / _n_block:.3f} hospitalizations per encounter")
+    _per_block = encounter_mapping.groupby("encounter_block").size()
+    print(f"  Encounters with >1 hospitalization: {(_per_block > 1).sum():,}")
+    print(f"  Max hospitalizations in one encounter: {_per_block.max()}")
+    return adt_stitched, block_hosp, encounter_mapping
+
+
+@app.cell
+def _(mo):
+    mo.md(r"""
     ## Step 2: Apply Inclusion Criteria
     """)
     return
 
 
 @app.cell
-def _(adt, hospitalization, pd):
-    # Get dataframes
-    hosp_df = hospitalization.df.copy()
-    adt_df = adt.df.copy()
-
-    # Merge hospitalization and ADT to get hospital_type
-    merged_df = pd.merge(
-        hosp_df,
-        adt_df[["hospitalization_id", "hospital_id", "hospital_type", "in_dttm", "location_category"]].drop_duplicates(),
-        on="hospitalization_id",
-        how="inner"
+def _(adt_stitched, block_hosp):
+    # Work at the stitched-encounter level: block_hosp has one row per
+    # encounter_block (hospitalization_id = EB<n>). Attach the encounter's
+    # admitting hospital = the hospital of the earliest ADT location (index).
+    hosp_lookup = (
+        adt_stitched.sort_values("in_dttm")
+        .drop_duplicates("hospitalization_id", keep="first")
+        [["hospitalization_id", "hospital_id", "hospital_type"]]
     )
+    merged_df = block_hosp.merge(hosp_lookup, on="hospitalization_id", how="inner")
 
-    print(f"Total hospitalizations after merge: {merged_df['hospitalization_id'].nunique():,}")
+    print(f"Total encounters after merge with ADT: {merged_df['hospitalization_id'].nunique():,}")
     return (merged_df,)
 
 
@@ -188,15 +248,36 @@ def _(cohort_df_ed):
 
 
 @app.cell
-def _(adt, cohort_df_hospital):
-    # Filter 5: Must have ED location during hospitalization
-    hosp_with_ed = set(adt.df[adt.df["location_category"].str.lower() == "ed"]["hospitalization_id"].unique())
+def _(adt_stitched, cohort_df_hospital):
+    # Filter 5: Must have an ED location during the encounter (stitched ADT)
+    _loc = adt_stitched["location_category"].str.lower()
+    hosp_with_ed = set(adt_stitched.loc[_loc == "ed", "hospitalization_id"].unique())
 
-    cohort_df_final = cohort_df_hospital[
+    cohort_df_ed_loc = cohort_df_hospital[
         cohort_df_hospital["hospitalization_id"].isin(hosp_with_ed)
     ].copy()
 
-    print(f"After ED location filter: {cohort_df_final['hospitalization_id'].nunique():,} hospitalizations")
+    print(f"After ED location filter: {cohort_df_ed_loc['hospitalization_id'].nunique():,} encounters")
+    return (cohort_df_ed_loc,)
+
+
+@app.cell
+def _(adt_stitched, cohort_df_ed_loc):
+    # Filter 6 (NEW): Must also have a ward or ICU location during the encounter,
+    # i.e. a true ED -> inpatient admission (drops ED-only visits sent home).
+    _loc = adt_stitched["location_category"].str.lower()
+    hosp_with_ward_icu = set(
+        adt_stitched.loc[_loc.isin(["ward", "icu"]), "hospitalization_id"].unique()
+    )
+
+    cohort_df_final = cohort_df_ed_loc[
+        cohort_df_ed_loc["hospitalization_id"].isin(hosp_with_ward_icu)
+    ].copy()
+
+    print(
+        f"After ED + (ward or ICU) filter: "
+        f"{cohort_df_final['hospitalization_id'].nunique():,} encounters"
+    )
     return (cohort_df_final,)
 
 
@@ -288,6 +369,146 @@ def _(final_cohort):
 @app.cell
 def _(mo):
     mo.md(r"""
+    ## Step 4b: CONSORT Diagram
+
+    Track the cohort count from all hospitalizations, through the stitch
+    collapse to encounter blocks, then each inclusion/exclusion filter. Counts
+    are saved to `consort_counts.json` and rendered to `consort_diagram.png`
+    (both shareable aggregate outputs, with <11 cell suppression).
+    """)
+    return
+
+
+@app.cell
+def _(
+    OUTPUT_DIR,
+    block_hosp,
+    cohort_df,
+    cohort_df_ed,
+    cohort_df_ed_loc,
+    cohort_df_filtered,
+    cohort_df_final,
+    cohort_df_hospital,
+    encounter_mapping,
+    final_cohort,
+    hospitalization,
+    merged_df,
+    su,
+):
+    # Reverse lookup: stitched encounter id -> member hospitalization ids
+    _map = encounter_mapping.copy()
+    _map["eb"] = _map["encounter_block"].map(su.encounter_id)
+
+    def _nhosp(df):
+        ebs = set(df["hospitalization_id"].unique())
+        return int(_map.loc[_map["eb"].isin(ebs), "hospitalization_id"].nunique())
+
+    def _row(step, df, n_blocks=None, n_hosp=None, n_pat=None):
+        if df is not None:
+            n_blocks = df["hospitalization_id"].nunique()
+            n_pat = df["patient_id"].nunique() if "patient_id" in df.columns else None
+            n_hosp = _nhosp(df)
+        return {
+            "step": step,
+            "n_encounter_blocks": None if n_blocks is None else int(n_blocks),
+            "n_hospitalizations": None if n_hosp is None else int(n_hosp),
+            "n_patients": None if n_pat is None else int(n_pat),
+        }
+
+    consort_steps = [
+        # Raw hospitalizations (pre-stitch): no encounter-block count yet
+        _row(
+            "all_hospitalizations", None,
+            n_hosp=hospitalization.df["hospitalization_id"].nunique(),
+            n_pat=hospitalization.df["patient_id"].nunique(),
+        ),
+        _row("after_stitch_6h", block_hosp),
+        _row("linked_to_adt", merged_df),
+        _row("age_ge_18", cohort_df),
+        _row("admitted_2018_2024", cohort_df_filtered),
+        _row("admitted_via_ed", cohort_df_ed),
+        _row("academic_or_community", cohort_df_hospital),
+        _row("has_ed_location", cohort_df_ed_loc),
+        _row("has_ed_and_ward_or_icu", cohort_df_final),
+        _row("final_cohort", final_cohort),
+    ]
+
+    # n_excluded = drop in encounter blocks vs the previous block-counted step
+    _prev = None
+    for _s in consort_steps:
+        _nb = _s["n_encounter_blocks"]
+        _s["n_excluded"] = int(_prev - _nb) if (_prev is not None and _nb is not None) else None
+        if _nb is not None:
+            _prev = _nb
+
+    su.save_consort(consort_steps, OUTPUT_DIR / "consort_counts.json")
+    _fig = su.plot_consort(consort_steps, title="Sepsis cohort CONSORT (6h-stitched encounters)")
+    _fig.savefig(OUTPUT_DIR / "consort_diagram.png", dpi=150, bbox_inches="tight")
+
+    print("CONSORT flow (encounter blocks):")
+    for _s in consort_steps:
+        print(
+            f"  {_s['step']:>24}: blocks={_s['n_encounter_blocks']}, "
+            f"hosps={_s['n_hospitalizations']}, excluded={_s['n_excluded']}"
+        )
+    return
+
+
+@app.cell
+def _(mo):
+    mo.md(r"""
+    ## Step 4c: Materialize Stitched CLIF Tables
+
+    Write a copy of every CLIF table the pipeline consumes into
+    `PHI_DIR/intermediate/stitched_tables/`, with `hospitalization_id`
+    overwritten by the stitched encounter id. Downstream notebooks point clifpy
+    at this derived directory (computed from `phi_directory` via
+    `su.stitched_dir`) so ASE, SOFA, CCI and the R analysis operate natively at
+    the encounter level — all driven from a single `clif_config.json`.
+    """)
+    return
+
+
+@app.cell
+def _(
+    DATA_DIR,
+    FILETYPE,
+    PHI_DIR,
+    TIMEZONE,
+    block_hosp,
+    encounter_mapping,
+    final_cohort,
+    su,
+):
+    # Resolve the cohort's original member hospitalization ids and patients
+    _final_ebs = set(final_cohort["hospitalization_id"].unique())
+    _map = encounter_mapping.copy()
+    _map["eb"] = _map["encounter_block"].map(su.encounter_id)
+    _member = _map[_map["eb"].isin(_final_ebs)]
+    member_hosp_ids = _member["hospitalization_id"].astype(str).unique().tolist()
+    patient_ids = final_cohort["patient_id"].astype(str).unique().tolist()
+    block_hosp_final = block_hosp[block_hosp["hospitalization_id"].isin(_final_ebs)].copy()
+
+    su.materialize_stitched_tables(
+        base_data_directory=DATA_DIR,
+        filetype=FILETYPE,
+        timezone=TIMEZONE,
+        phi_dir=PHI_DIR,
+        mapping=encounter_mapping,
+        member_hosp_ids=member_hosp_ids,
+        patient_ids=patient_ids,
+        block_hospitalization=block_hosp_final,
+        verbose=True,
+    )
+
+    STITCHED_DIR = str(su.stitched_dir(PHI_DIR))
+    print(f"Stitched tables -> {STITCHED_DIR}")
+    return (STITCHED_DIR,)
+
+
+@app.cell
+def _(mo):
+    mo.md(r"""
     ## Step 5: Calculate Adult Sepsis Event (ASE)
     """)
     return
@@ -300,18 +521,22 @@ def _():
 
 
 @app.cell
-def _(compute_ase, final_cohort):
-    # Get hospitalization IDs from cohort
+def _(FILETYPE, STITCHED_DIR, TIMEZONE, compute_ase, final_cohort):
+    # Get stitched-encounter IDs from cohort (stored in hospitalization_id)
     hosp_ids = final_cohort["hospitalization_id"].astype(str).unique().tolist()
-    print(f"Running ASE calculation on {len(hosp_ids):,} hospitalizations...")
+    print(f"Running ASE calculation on {len(hosp_ids):,} stitched encounters...")
 
-    # Calculate ASE using clifpy (returns ALL blood cultures, both ASE and non-ASE)
-    # include_lactate=True is REQUIRED to compare lactate vs non-lactate definitions
+    # Calculate ASE using clifpy (returns ALL blood cultures, both ASE and non-ASE).
+    # Runs against the STITCHED directory so blood cultures, QAD antibiotics and
+    # organ dysfunction from all member hospitalizations are grouped under one
+    # encounter id. include_lactate=True is REQUIRED to compare definitions:
     # - sepsis: ASE with lactate as organ dysfunction criterion
     # - sepsis_wo_lactate: ASE without lactate criterion
     ase_results_all = compute_ase(
         hospitalization_ids=hosp_ids,
-        config_path="clif_config.json",
+        data_directory=STITCHED_DIR,
+        filetype=FILETYPE,
+        timezone=TIMEZONE,
         apply_rit=True,
         rit_only_hospital_onset=True,
         include_lactate=True,  # Must be True to compare lactate vs non-lactate
@@ -460,7 +685,22 @@ def _(mo):
 
 
 @app.cell
-def _(DATA_DIR, FILETYPE, Labs, OUTPUT_DIR, TIMEZONE, adt, hospitalization):
+def _(
+    DATA_DIR,
+    FILETYPE,
+    Labs,
+    OUTPUT_DIR,
+    TIMEZONE,
+    adt,
+    encounter_mapping,
+    hospitalization,
+    su,
+):
+    # NOTE: this hospital-level utilization rate is computed over ALL
+    # hospitalizations (the full denominator), so it deliberately uses the
+    # original (un-stitched) tables. Only the per-encounter `lactate_counts`
+    # returned below is re-keyed to the stitched encounter id for the cohort.
+
     # --- 1. All hospitalizations (unfiltered) with LOS ---
     all_hosp = hospitalization.df[["hospitalization_id", "admission_dttm", "discharge_dttm"]].copy()
     all_hosp = all_hosp.dropna(subset=["admission_dttm", "discharge_dttm"])
@@ -489,15 +729,23 @@ def _(DATA_DIR, FILETYPE, Labs, OUTPUT_DIR, TIMEZONE, adt, hospitalization):
         timezone=TIMEZONE,
         filters={"lab_category": ["lactate"]},
     )
-    lactate_counts = (
+    # Original-id counts drive the hospital-wide rate (denominator = all hosps)
+    lactate_counts_orig = (
         lactate_labs.df
         .groupby("hospitalization_id")
         .size()
         .reset_index(name="lactate_orders")
     )
 
-    # --- 4. Join lactate counts onto hospitalizations ---
-    all_hosp = all_hosp.merge(lactate_counts, on="hospitalization_id", how="left")
+    # Stitched-encounter counts drive the per-encounter any_lactate_ordered flag
+    _lac_eb = lactate_labs.df.merge(encounter_mapping, on="hospitalization_id", how="inner")
+    _lac_eb["hospitalization_id"] = _lac_eb["encounter_block"].map(su.encounter_id)
+    lactate_counts = (
+        _lac_eb.groupby("hospitalization_id").size().reset_index(name="lactate_orders")
+    )
+
+    # --- 4. Join lactate counts onto hospitalizations (rate uses original ids) ---
+    all_hosp = all_hosp.merge(lactate_counts_orig, on="hospitalization_id", how="left")
     all_hosp["lactate_orders"] = all_hosp["lactate_orders"].fillna(0).astype(int)
 
     # --- 5. Aggregate by hospital_id, hospital_type, admission_year ---
@@ -525,7 +773,7 @@ def _(DATA_DIR, FILETYPE, Labs, OUTPUT_DIR, TIMEZONE, adt, hospitalization):
     print(f"Lactate orders per 1,000 patient-days saved to: {lactate_rate_path}")
     print(f"Shape: {lactate_rate.shape}")
     print(lactate_rate.head(10))
-    return lactate_counts, lactate_rate
+    return lactate_counts, lactate_labs, lactate_rate
 
 
 @app.cell
@@ -573,86 +821,222 @@ def _(mo):
 
 
 @app.cell
-def _(DATA_DIR, FILETYPE, HospitalDiagnosis, TIMEZONE, calculate_cci):
+def _(FILETYPE, HospitalDiagnosis, STITCHED_DIR, TIMEZONE, calculate_cci):
+    # Read the STITCHED hospital_diagnosis so CCI is keyed by encounter id
+    # (diagnoses from all member hospitalizations roll up to the encounter).
     hospital_diagnosis = HospitalDiagnosis.from_file(
-        data_directory=DATA_DIR,
+        data_directory=STITCHED_DIR,
         filetype=FILETYPE,
         timezone=TIMEZONE,
     )
     cci_df = calculate_cci(hospital_diagnosis)
-    print(f"CCI computed for {len(cci_df):,} hospitalizations")
+    print(f"CCI computed for {len(cci_df):,} encounters")
     print(f"CCI score distribution:\n{cci_df['cci_score'].describe()}")
     return (cci_df,)
 
 
 @app.cell
 def _(
-    DATA_DIR,
     FILETYPE,
+    STITCHED_DIR,
     TIMEZONE,
     compute_sofa_polars,
     final_cohort,
     pd,
     pl,
 ):
-    # Build SOFA cohort with two window types per hospitalization:
+    # Build SOFA cohort with two window types per stitched encounter:
     # 1. 24-hour window (admission → admission + 24h) — standardized severity measure
-    # 2. Full-hospitalization window (admission → discharge) — fallback
+    # 2. Full-encounter window (admission → discharge) — fallback
+    #
+    # The cohort's `hospitalization_id` already holds the stitched encounter id and
+    # the STITCHED tables are keyed the same way, so compute_sofa_polars aggregates
+    # labs/vitals across the whole encounter. `sofa_window_id` is a throwaway label
+    # distinguishing the 24h vs full window for the SAME encounter (it is NOT the
+    # stitched encounter id).
 
-    # 24-hour SOFA (admission → admission + 24h, for all hospitalizations)
+    # 24-hour SOFA (admission → admission + 24h)
     sofa_24h = final_cohort[["hospitalization_id", "admission_dttm"]].drop_duplicates(
         subset=["hospitalization_id"]
     ).copy()
-    sofa_24h["encounter_block"] = sofa_24h["hospitalization_id"].astype(str) + "_24h"
+    sofa_24h["sofa_window_id"] = sofa_24h["hospitalization_id"].astype(str) + "_24h"
     sofa_24h["end_dttm"] = sofa_24h["admission_dttm"] + pd.Timedelta(hours=24)
     sofa_24h = sofa_24h.rename(columns={"admission_dttm": "start_dttm"})
 
-    # Full-hospitalization SOFA (admission → discharge, fallback)
+    # Full-encounter SOFA (admission → discharge, fallback)
     full_hosp = final_cohort[["hospitalization_id", "admission_dttm", "discharge_dttm"]].drop_duplicates(
         subset=["hospitalization_id"]
     )
-    full_hosp["encounter_block"] = full_hosp["hospitalization_id"].astype(str) + "_full"
+    full_hosp["sofa_window_id"] = full_hosp["hospitalization_id"].astype(str) + "_full"
     full_hosp = full_hosp.rename(columns={"admission_dttm": "start_dttm", "discharge_dttm": "end_dttm"})
 
     # Combine and convert to polars for compute_sofa_polars
     sofa_cohort_pl = pl.from_pandas(
         pd.concat([sofa_24h, full_hosp], ignore_index=True)[
-            ["hospitalization_id", "encounter_block", "start_dttm", "end_dttm"]
+            ["hospitalization_id", "sofa_window_id", "start_dttm", "end_dttm"]
         ]
     )
-    print(f"SOFA cohort: {len(sofa_cohort_pl):,} encounter blocks")
-    print(f"  24-hour blocks: {len(sofa_24h):,}")
-    print(f"  Full-hospitalization blocks: {len(full_hosp):,}")
+    print(f"SOFA cohort: {len(sofa_cohort_pl):,} encounter-windows")
+    print(f"  24-hour windows: {len(sofa_24h):,}")
+    print(f"  Full-encounter windows: {len(full_hosp):,}")
 
-    # Compute SOFA scores within each time window
+    # Compute SOFA scores within each time window (grouped by sofa_window_id)
     sofa_result_pl = compute_sofa_polars(
-        DATA_DIR,
+        STITCHED_DIR,
         sofa_cohort_pl,
         filetype=FILETYPE,
-        id_name="encounter_block",
+        id_name="sofa_window_id",
         timezone=TIMEZONE,
     )
 
-    # Split results by suffix
+    # Split results by suffix, recovering the stitched encounter id
     sofa_24h_df = (
         sofa_result_pl
-        .filter(pl.col("encounter_block").str.ends_with("_24h"))
+        .filter(pl.col("sofa_window_id").str.ends_with("_24h"))
         .with_columns(
-            pl.col("encounter_block").str.replace("_24h$", "").alias("hospitalization_id")
+            pl.col("sofa_window_id").str.replace("_24h$", "").alias("hospitalization_id")
         )
         .select(["hospitalization_id", "sofa_total"])
     )
     sofa_full_df = (
         sofa_result_pl
-        .filter(pl.col("encounter_block").str.ends_with("_full"))
+        .filter(pl.col("sofa_window_id").str.ends_with("_full"))
         .with_columns(
-            pl.col("encounter_block").str.replace("_full$", "").alias("hospitalization_id")
+            pl.col("sofa_window_id").str.replace("_full$", "").alias("hospitalization_id")
         )
         .select(["hospitalization_id", "sofa_total"])
     )
 
-    print(f"SOFA results: {len(sofa_24h_df):,} 24-hour, {len(sofa_full_df):,} full-hosp")
+    print(f"SOFA results: {len(sofa_24h_df):,} 24-hour, {len(sofa_full_df):,} full-encounter")
     return sofa_24h_df, sofa_full_df
+
+
+@app.cell
+def _(
+    PHI_DIR,
+    adt_stitched,
+    ase_results,
+    encounter_mapping,
+    final_cohort,
+    hospitalization,
+    lactate_counts,
+    lactate_labs,
+    pd,
+    su,
+):
+    # Enrich the stitched-encounter cohort with all hospitalization-level
+    # variables needed by the analytic dataset. Computed here (1 row per
+    # encounter) so the downstream merge into `analysis_df` (2 rows per
+    # encounter) cannot change row count.
+
+    enriched = final_cohort.copy()
+    _n0 = enriched["hospitalization_id"].nunique()
+    assert len(enriched) == _n0, "final_cohort already has duplicate encounter ids"
+
+    # --- 1. any_lactate_ordered_whole_hospitalization (renamed from any_lactate_ordered) ---
+    enriched = enriched.merge(
+        lactate_counts.assign(
+            any_lactate_ordered_whole_hospitalization=lambda d: d["lactate_orders"].gt(0).astype(int)
+        )[["hospitalization_id", "any_lactate_ordered_whole_hospitalization"]],
+        on="hospitalization_id",
+        how="left",
+    )
+    enriched["any_lactate_ordered_whole_hospitalization"] = (
+        enriched["any_lactate_ordered_whole_hospitalization"].fillna(0).astype(int)
+    )
+
+    # --- 2. lactate_ordered_in_window (±2 days of blood_culture_dttm) ---
+    bc_anchor = ase_results[["hospitalization_id", "blood_culture_dttm"]].dropna()
+    _lac = lactate_labs.df.merge(encounter_mapping, on="hospitalization_id", how="inner")
+    _lac["hospitalization_id"] = _lac["encounter_block"].map(su.encounter_id)
+    _lac = _lac.merge(bc_anchor, on="hospitalization_id", how="inner")
+    # lab_order_dttm can arrive as object dtype after the merge; coerce both
+    # sides to UTC datetime so the subtraction always yields a Timedelta.
+    _lac["lab_order_dttm"] = pd.to_datetime(_lac["lab_order_dttm"], utc=True, errors="coerce")
+    _lac["blood_culture_dttm"] = pd.to_datetime(_lac["blood_culture_dttm"], utc=True, errors="coerce")
+    _lac = _lac.dropna(subset=["lab_order_dttm", "blood_culture_dttm"])
+    _lac["days_from_bc"] = (
+        _lac["lab_order_dttm"] - _lac["blood_culture_dttm"]
+    ).dt.total_seconds() / 86400
+    _lac_win = _lac[_lac["days_from_bc"].abs() <= 2]
+    in_window_counts = (
+        _lac_win.groupby("hospitalization_id").size().reset_index(name="n_in_window")
+    )
+    enriched = enriched.merge(in_window_counts, on="hospitalization_id", how="left")
+    enriched["lactate_ordered_in_window"] = enriched["n_in_window"].fillna(0).gt(0).astype(int)
+    enriched = enriched.drop(columns="n_in_window")
+
+    assert (
+        enriched["lactate_ordered_in_window"]
+        <= enriched["any_lactate_ordered_whole_hospitalization"]
+    ).all(), "lactate_ordered_in_window > whole_hospitalization for some encounter"
+
+    # --- 3. hospital_los_days ---
+    enriched["hospital_los_days"] = (
+        (enriched["discharge_dttm"] - enriched["admission_dttm"]).dt.total_seconds() / 86400
+    ).clip(lower=0)
+
+    # --- 4. had_icu + icu_los_days (from stitched ADT) ---
+    # Per-stay duration is clipped at 0 to defend against source ADT rows where
+    # out_dttm < in_dttm (a data-quality artifact: a handful of stays yield
+    # ~−45,000-day durations and would wreck the sum). had_icu still reflects
+    # the presence of any ICU stay, regardless of timestamp quality.
+    icu_stays = adt_stitched[adt_stitched["location_category"].str.lower() == "icu"].copy()
+    icu_stays["icu_duration"] = (
+        (pd.to_datetime(icu_stays["out_dttm"]) - pd.to_datetime(icu_stays["in_dttm"]))
+        .dt.total_seconds() / 86400
+    ).clip(lower=0)
+    icu_los_agg = (
+        icu_stays.groupby("hospitalization_id")["icu_duration"].sum()
+        .reset_index().rename(columns={"icu_duration": "icu_los_days"})
+    )
+    enriched = enriched.merge(icu_los_agg, on="hospitalization_id", how="left")
+    enriched["had_icu"] = enriched["icu_los_days"].notna().astype(int)
+    enriched["icu_los_days"] = enriched["icu_los_days"].fillna(0)
+
+    # --- 5. in_hospital_death ---
+    # discharge_category lives on the per-hospitalization table; for a stitched
+    # encounter take the value from the LAST hospitalization in the block.
+    if "discharge_category" not in enriched.columns:
+        _hosp_with_block = hospitalization.df[
+            ["hospitalization_id", "discharge_dttm", "discharge_category"]
+        ].merge(encounter_mapping, on="hospitalization_id", how="inner")
+        last_disch = (
+            _hosp_with_block.sort_values("discharge_dttm")
+            .drop_duplicates("encounter_block", keep="last")
+            .copy()
+        )
+        last_disch["hospitalization_id"] = last_disch["encounter_block"].map(su.encounter_id)
+        enriched = enriched.merge(
+            last_disch[["hospitalization_id", "discharge_category"]],
+            on="hospitalization_id",
+            how="left",
+        )
+
+    enriched["in_hospital_death"] = (
+        enriched["discharge_category"].str.lower().str.contains("expired", na=False)
+        | (
+            enriched["death_dttm"].notna()
+            & (pd.to_datetime(enriched["death_dttm"]) <= enriched["discharge_dttm"])
+        )
+    ).astype(int)
+
+    # --- Invariants & save (overwrites cohort_df.parquet from Step 4) ---
+    assert enriched["hospitalization_id"].is_unique, "enrichment introduced duplicate encounter ids"
+    assert len(enriched) == _n0, f"enrichment changed row count: {_n0} -> {len(enriched)}"
+
+    enriched.to_parquet(PHI_DIR / "cohort_df.parquet", index=False)
+
+    print(f"Enriched cohort: {len(enriched):,} encounters, {enriched.shape[1]} columns")
+    print(f"  any_lactate_ordered_whole_hospitalization=1: {enriched['any_lactate_ordered_whole_hospitalization'].sum():,}")
+    print(f"  lactate_ordered_in_window=1: {enriched['lactate_ordered_in_window'].sum():,}")
+    print(f"  had_icu=1: {enriched['had_icu'].sum():,}")
+    print(f"  in_hospital_death=1: {enriched['in_hospital_death'].sum():,} "
+          f"({enriched['in_hospital_death'].mean()*100:.1f}%)")
+    print(f"  hospital_los_days median: {enriched['hospital_los_days'].median():.1f}d")
+    print(f"  icu_los_days median (ICU only): "
+          f"{enriched.loc[enriched['had_icu']==1, 'icu_los_days'].median():.1f}d")
+    return (enriched,)
 
 
 @app.cell
@@ -660,8 +1044,8 @@ def _(
     PHI_DIR,
     ase_results,
     cci_df,
+    enriched,
     final_cohort,
-    lactate_counts,
     lactate_rate,
     pd,
     sofa_24h_df,
@@ -755,9 +1139,23 @@ def _(
     pi_map = ase_results.drop_duplicates("hospitalization_id").set_index("hospitalization_id")["presumed_infection"]
     analysis_df["presumed_infection"] = analysis_df["hospitalization_id"].map(pi_map).fillna(0).astype(int)
 
-    # --- 7. Any lactate ordered (hospitalization-level) ---
-    lactate_flag = lactate_counts.set_index("hospitalization_id")["lactate_orders"].gt(0).astype(int)
-    analysis_df["any_lactate_ordered"] = analysis_df["hospitalization_id"].map(lactate_flag).fillna(0).astype(int)
+    # --- 7. Merge all enriched hospitalization-level variables in a single join ---
+    # `enriched` has one unique row per hospitalization_id (asserted upstream),
+    # so this left merge cannot change analysis_df row count.
+    NEW_COLS = [
+        "race_category", "ethnicity_category", "race_ethnicity",
+        "any_lactate_ordered_whole_hospitalization", "lactate_ordered_in_window",
+        "hospital_los_days", "had_icu", "icu_los_days", "in_hospital_death",
+    ]
+    _n_before = len(analysis_df)
+    analysis_df = analysis_df.merge(
+        enriched[["hospitalization_id"] + NEW_COLS],
+        on="hospitalization_id",
+        how="left",
+    )
+    assert len(analysis_df) == _n_before, (
+        f"enriched merge changed analysis_df row count: {_n_before} -> {len(analysis_df)}"
+    )
 
     # --- 8. Lactate ordering rate ---
     analysis_df["year"] = analysis_df["admission_dttm"].dt.year
@@ -787,15 +1185,23 @@ def _(
         "onset_community1_hospital0",
         "age",
         "sex",
+        "race_category",
+        "ethnicity_category",
+        "race_ethnicity",
         "cci",
         "worst_sofa_admission_to_24h",
-        "any_lactate_ordered",
+        "any_lactate_ordered_whole_hospitalization",
+        "lactate_ordered_in_window",
         "presumed_infection",
         "hospital_id",
         "hospital_type",
         "lactate_order_per_1000_patient_days",
         "year",
         "hospitalizations_from_ed_per_year",
+        "hospital_los_days",
+        "had_icu",
+        "icu_los_days",
+        "in_hospital_death",
     ]
     analysis_df = analysis_df[final_cols]
 
@@ -810,12 +1216,21 @@ def _(
     print(f"ASE=1 (wl=0): {analysis_df.loc[analysis_df['defined_w_lactic']==0, 'ASE'].sum():,}")
     print(f"SOFA non-null: {analysis_df['worst_sofa_admission_to_24h'].notna().sum():,}")
     print(f"CCI non-null: {analysis_df['cci'].notna().sum():,}")
-    print(f"any_lactate_ordered=1: {analysis_df['any_lactate_ordered'].sum():,}")
+    print(f"any_lactate_ordered_whole_hospitalization=1: {analysis_df['any_lactate_ordered_whole_hospitalization'].sum():,}")
+    print(f"lactate_ordered_in_window=1: {analysis_df['lactate_ordered_in_window'].sum():,}")
     print(f"presumed_infection=1: {analysis_df['presumed_infection'].sum():,}")
+    print(f"had_icu=1: {analysis_df['had_icu'].sum():,}")
+    print(f"in_hospital_death=1: {analysis_df['in_hospital_death'].sum():,} "
+          f"({analysis_df['in_hospital_death'].mean()*100:.1f}%)")
+    print(f"race_ethnicity distribution:\n{analysis_df.drop_duplicates('hospitalization_id')['race_ethnicity'].value_counts()}")
     print(f"Columns: {list(analysis_df.columns)}")
     print(f"hospital_type values: {analysis_df['hospital_type'].value_counts().to_dict()}")
     print(f"year range: {analysis_df['year'].min()}–{analysis_df['year'].max()}")
     print(f"hospitalizations_from_ed_per_year non-null: {analysis_df['hospitalizations_from_ed_per_year'].notna().sum():,}")
+    assert (
+        analysis_df["lactate_ordered_in_window"]
+        <= analysis_df["any_lactate_ordered_whole_hospitalization"]
+    ).all(), "lactate_ordered_in_window > whole_hospitalization in analysis_df"
     return
 
 
