@@ -177,7 +177,8 @@ cp clif_config_template.json clif_config.json
   "filetype": "parquet",
   "timezone": "US/Eastern",
   "output_directory": "./output_to_BOX",
-  "phi_directory": "./phi"
+  "phi_directory": "./phi",
+  "stitch_time_interval_hours": 6
 }
 ```
 
@@ -197,7 +198,7 @@ This is a **hybrid Python + R** pipeline:
 uv sync
 ```
 
-> **Note:** If the Quarto step fails, you can open `Code/04_ase_site_analysis.qmd` in RStudio and render it directly from there.
+> **Note:** If the Quarto step fails, you can open `Code/04_ase_site_analysis_v9.qmd` in RStudio and render it directly from there.
 
 ### 3. Run the pipeline
 
@@ -206,7 +207,7 @@ uv sync
 bash run.sh
 
 # Windows
-run.bat
+.\run.ps1
 ```
 
 This executes all scripts sequentially and logs output to `logs/`.
@@ -218,4 +219,4 @@ This executes all scripts sequentially and logs output to `logs/`.
 | 1 | `Code/01_cohort.py` | Builds base cohort, computes ASE flags and organ dysfunction timestamps |
 | 2 | `Code/02_table1.py` | Generates Table 1 with demographics, comorbidities, acuity, and outcomes |
 | 3 | `Code/03_ase_visualizations.py` | Creates Sankey diagrams, temporal trends, and ordering intensity plots |
-| 4 | `Code/04_ase_site_analysis.qmd` | Runs logistic regression modeling lactate ordering intensity vs. ASE rates |
+| 4 | `Code/04_ase_site_analysis_v9.qmd` | Runs logistic regression modeling lactate ordering intensity vs. ASE rates |

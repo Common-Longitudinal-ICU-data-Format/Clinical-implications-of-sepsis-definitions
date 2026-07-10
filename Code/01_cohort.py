@@ -764,13 +764,10 @@ def _(
     ) * 1000
 
     # --- 6. Save ---
-    lactate_rate_path = OUTPUT_DIR / "lactate_orders_per_1000_patient_days.parquet"
-    lactate_rate.to_parquet(lactate_rate_path, index=False)
-
     lactate_rate_csv_path = OUTPUT_DIR / "lactate_orders_per_1000_patient_days.csv"
     lactate_rate.to_csv(lactate_rate_csv_path, index=False)
 
-    print(f"Lactate orders per 1,000 patient-days saved to: {lactate_rate_path}")
+    print(f"Lactate orders per 1,000 patient-days saved to: {lactate_rate_csv_path}")
     print(f"Shape: {lactate_rate.shape}")
     print(lactate_rate.head(10))
     return lactate_counts, lactate_labs, lactate_rate

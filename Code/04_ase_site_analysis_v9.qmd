@@ -58,15 +58,29 @@ set.seed(20240101)
 # ── Site configuration (from clif_config.json) ────────────────────────────────
 config     <- fromJSON(here("clif_config.json"))
 SITE_ID    <- config$site_name
-DATA_PATH  <- here(config$phi_directory, "analysis_dataset.parquet")
+PHI_DIR    <- here(config$phi_directory)
 OUTPUT_DIR <- here(config$output_directory)
+DATA_PATH  <- file.path(PHI_DIR, "analysis_dataset.parquet")
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Create output directories
+# Create local PHI and shareable output directories. PHI_DIR contains row-level
+# input/intermediate data; OUTPUT_DIR contains only de-identified return files.
+dir.create(PHI_DIR,    showWarnings = FALSE, recursive = TRUE)
+dir.create(OUTPUT_DIR, showWarnings = FALSE, recursive = TRUE)
 dir.create(file.path(OUTPUT_DIR, "figures"),     showWarnings = FALSE, recursive = TRUE)
 dir.create(file.path(OUTPUT_DIR, "tables"),      showWarnings = FALSE, recursive = TRUE)
 dir.create(file.path(OUTPUT_DIR, "diagnostics"), showWarnings = FALSE, recursive = TRUE)
 dir.create(file.path(OUTPUT_DIR, "models"),      showWarnings = FALSE, recursive = TRUE)
+
+if (normalizePath(PHI_DIR, mustWork = FALSE) == normalizePath(OUTPUT_DIR, mustWork = FALSE)) {
+  stop("phi_directory and output_directory must be different. ",
+       "PHI stays local in phi_directory; de-identified outputs go to output_directory.")
+}
+
+if (!file.exists(DATA_PATH)) {
+  stop("Required PHI input not found: ", DATA_PATH, "\n",
+       "Run Code/01_cohort.py first; it writes analysis_dataset.parquet to phi_directory.")
+}
 
 # ── Helper functions ──────────────────────────────────────────────────────────
 
@@ -672,8 +686,9 @@ hosp_crosswalk <- df %>%
   arrange(hospital_id) %>%
   mutate(hospital_id_deident = row_number())
 
-cat("\nHospital de-identification crosswalk (local reference — not exported):\n")
-print(hosp_crosswalk)
+write_csv(hosp_crosswalk,
+          file.path(PHI_DIR, paste0(SITE_ID, "_hospital_deident_crosswalk.csv")))
+cat("\nHospital de-identification crosswalk saved locally under phi_directory.\n")
 cat("DO NOT share hospital identity mapping with the coordinating center.\n")
 
 df <- df %>% left_join(hosp_crosswalk, by = "hospital_id")
@@ -2299,10 +2314,59 @@ write_if(coef_sa4,
 
 cat("CSV exports complete.\n")
 
-# 6.3 RDS + JSON
-saveRDS(output_list,
-        file = file.path(OUTPUT_DIR, "models",
-                    paste0(SITE_ID, "_ASE_results.rds")))
+# 6.3 Former RDS bundle as CSV + JSON
+# RDS export intentionally disabled: R object bundles can preserve model/plot
+# internals. Export tabular/scalar contents as CSV instead.
+rds_path <- file.path(OUTPUT_DIR, "models", paste0(SITE_ID, "_ASE_results.rds"))
+if (file.exists(rds_path)) file.remove(rds_path)
+# saveRDS(output_list,
+#         file = rds_path)
+
+bundle_csv_dir <- file.path(OUTPUT_DIR, "models", paste0(SITE_ID, "_ASE_results_csv"))
+if (dir.exists(bundle_csv_dir)) unlink(bundle_csv_dir, recursive = TRUE)
+dir.create(bundle_csv_dir, showWarnings = FALSE, recursive = TRUE)
+
+write_bundle_csv <- function(obj, component) {
+  out_file <- paste0(component, ".csv")
+  out_path <- file.path(bundle_csv_dir, out_file)
+  manifest_path <- file.path("models", paste0(SITE_ID, "_ASE_results_csv"), out_file)
+
+  if (is.null(obj)) {
+    return(tibble(component = component, file = NA_character_, exported = FALSE,
+                  reason = "NULL object"))
+  }
+
+  if (inherits(obj, c("gg", "ggplot", "patchwork"))) {
+    return(tibble(component = component, file = NA_character_, exported = FALSE,
+                  reason = "plot object; exported separately as figures"))
+  }
+
+  if (is.data.frame(obj)) {
+    write_csv(obj, out_path)
+    return(tibble(component = component, file = manifest_path, exported = TRUE,
+                  reason = "data frame"))
+  }
+
+  if (is.matrix(obj)) {
+    write_csv(as.data.frame(obj) %>% rownames_to_column("rowname"), out_path)
+    return(tibble(component = component, file = manifest_path, exported = TRUE,
+                  reason = "matrix"))
+  }
+
+  if (is.atomic(obj)) {
+    values <- tibble(index = seq_along(obj), value = as.character(obj))
+    write_csv(values, out_path)
+    return(tibble(component = component, file = manifest_path, exported = TRUE,
+                  reason = "atomic vector"))
+  }
+
+  tibble(component = component, file = NA_character_, exported = FALSE,
+         reason = paste("unsupported object class:", paste(class(obj), collapse = "/")))
+}
+
+bundle_manifest <- imap_dfr(output_list, write_bundle_csv)
+write_csv(bundle_manifest,
+          file.path(bundle_csv_dir, paste0(SITE_ID, "_ASE_results_manifest.csv")))
 
 output_json <- output_list
 output_json[c("fig_lactate_trend", "fig_ase_gap",
@@ -2313,10 +2377,11 @@ output_json$vcov_model_b <- if (!is.null(vcov_b)) as.data.frame(vcov_b) else NUL
 
 write_json(output_json,
            path       = file.path(OUTPUT_DIR, "models",
-                             paste0(SITE_ID, "_ASE_results.json")),
+                              paste0(SITE_ID, "_ASE_results.json")),
            pretty     = TRUE, auto_unbox = TRUE, na = "null")
 
-cat("RDS and JSON exports complete.\n")
+cat("Former RDS bundle exported as CSV files; RDS export is disabled.\n")
+cat("JSON export complete.\n")
 cat(paste0("All outputs saved to ", OUTPUT_DIR, " — share entire folder with coordinating center.\n"))
 ```
 
@@ -2368,8 +2433,8 @@ The following files have been saved to the `<output_directory>/` directory (as c
 - `<output_directory>/models/[SITE]_16_vcov_model_b.csv` — vcov for Model B (coordinating center use)
 - `<output_directory>/models/[SITE]_17_re_variance_all.csv` — **all RE variance estimates, one row per analysis x framing x model_label (x year for SA2b)** ⭐. Between-hospital sigma^2/sigma from glmer; NA stubs on the glm (single-hospital) path.
 - `<output_directory>/models/[SITE]_18_sa4_sofa_dropped_coefs.csv` — SA4 model_a, model_b, model_b_alt coefficients (SOFA dropped)
-- `<output_directory>/models/[SITE]_ASE_results.rds` — full output bundle ⭐
 - `<output_directory>/models/[SITE]_ASE_results.json`
+- `<output_directory>/models/[SITE]_ASE_results_csv/` — CSV replacement for the former RDS bundle. Plot objects are not exported here because figures are saved separately.
 
 Models folder renumbered to consecutive 08–18 as of this restructuring (previously had gaps from the contrast-file consolidation, then renumbered again when the 6 separate RE variance files were folded into one). This is a one-time renumbering done ahead of any cross-site results and before ASE_metaanalysis_v3.R has been updated to match — no downstream script depends on the old numbering yet. Once this version goes out to other sites and the CC script is built against it, any future consolidation should go back to leaving gaps rather than renumbering, so a stale CC script fails loudly on a missing file instead of silently reading the wrong one under a reused number.
 
@@ -2383,4 +2448,4 @@ Models folder renumbered to consecutive 08–18 as of this restructuring (previo
 
 **Do NOT share (local only):**
 
-- Hospital de-identification crosswalk (printed to console only)
+- `<phi_directory>/[SITE]_hospital_deident_crosswalk.csv`
