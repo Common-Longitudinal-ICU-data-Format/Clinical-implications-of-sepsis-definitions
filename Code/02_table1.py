@@ -746,16 +746,26 @@ def _(mo):
 
 @app.cell
 def _():
+    # Small-cell suppression threshold (study standard, matching the coordinating
+    # center): counts 0 < n < SMALL_CELL_THRESHOLD are masked as "<N" in the
+    # shared Table 1 outputs. Primary suppression only.
+    SMALL_CELL_THRESHOLD = 5
+
     # Helper functions for summarizing variables
     def summarize_continuous(df, col):
         """Summarize continuous variable as mean (SD)"""
         return f"{df[col].mean():.1f} ({df[col].std():.1f})"
 
     def summarize_binary(df, col):
-        """Summarize binary variable as n (%)"""
+        """Summarize binary variable as n (%); small cells (0<n<T) masked as "<T"."""
         n = df[col].sum() if isinstance(col, str) else col.sum()
         total = len(df)
-        return "0 (0.0%)" if total == 0 else f"{int(n)} ({100*n/total:.1f}%)"
+        if total == 0:
+            return "0 (0.0%)"
+        n = int(n)
+        if 0 < n < SMALL_CELL_THRESHOLD:
+            return f"<{SMALL_CELL_THRESHOLD}"
+        return f"{n} ({100*n/total:.1f}%)"
 
     def summarize_median_iqr(df, col):
         """Summarize continuous variable as median (IQR)"""
@@ -766,11 +776,16 @@ def _():
         q25 = vals.quantile(0.25)
         q75 = vals.quantile(0.75)
         return f"{med:.1f} ({q25:.1f}-{q75:.1f})"
-    return summarize_binary, summarize_continuous, summarize_median_iqr
+    return (
+        SMALL_CELL_THRESHOLD,
+        summarize_binary,
+        summarize_continuous,
+        summarize_median_iqr,
+    )
 
 
 @app.cell
-def _():
+def _(SMALL_CELL_THRESHOLD):
     import math
 
     def compute_table1_json(groups, site_name, table_type):
@@ -815,19 +830,25 @@ def _():
                 "q75": _safe(vals.quantile(0.75)),
             }
 
+        def _cell(count, total):
+            """Small-cell suppression: 0 < count < T -> null + suppressed flag."""
+            if 0 < count < SMALL_CELL_THRESHOLD:
+                return {"count": None, "total": total, "suppressed": True}
+            return {"count": count, "total": total}
+
         def binary(df, col_or_mask):
             """Summarise a binary variable."""
             if isinstance(col_or_mask, str):
                 count = int(df[col_or_mask].sum())
             else:
                 count = int(col_or_mask.sum())
-            return {"count": count, "total": len(df)}
+            return _cell(count, len(df))
 
         def categ(df, col, categories):
             """Summarise a categorical variable."""
             total = len(df)
             return {
-                cat: {"count": int((df[col] == cat).sum()), "total": total}
+                cat: _cell(int((df[col] == cat).sum()), total)
                 for cat in categories
             }
 
@@ -960,6 +981,7 @@ def _():
 
 @app.cell
 def _(
+    SMALL_CELL_THRESHOLD,
     analysis_df,
     pd,
     summarize_binary,
@@ -1209,8 +1231,10 @@ def _(
         if len(counts) == 0:
             return "N/A"
         top = counts.index[0]
-        n = counts.iloc[0]
+        n = int(counts.iloc[0])
         total = len(vals)
+        if 0 < n < SMALL_CELL_THRESHOLD:
+            return f"{top}: <{SMALL_CELL_THRESHOLD}"
         return f"{top}: {n} ({100*n/total:.1f}%)"
 
     # First criteria for ASE with lactate (only for ASE groups)

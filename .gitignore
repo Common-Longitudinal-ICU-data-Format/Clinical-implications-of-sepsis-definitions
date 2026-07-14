@@ -13,3 +13,8 @@ clif_config.json
 *.phi
 phi/
 clif_config_nu.json
+clif_config_ucmc.json
+output_to_BOX_nu/
+output_to_BOX_ucmc/
+phi_nu/
+phi_ucmc/
