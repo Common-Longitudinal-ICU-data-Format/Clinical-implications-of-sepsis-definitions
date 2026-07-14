@@ -12,3 +12,4 @@ clif_config.json
 *.log
 *.phi
 phi/
+clif_config_nu.json

@@ -105,8 +105,11 @@ def _(mo):
 
 
 @app.cell
-def _(Adt, DATA_DIR, FILETYPE, Hospitalization, Patient, TIMEZONE):
-    # Load patient, hospitalization, and adt tables
+def _(DATA_DIR, FILETYPE, Hospitalization, Patient, TIMEZONE):
+    # Load patient + hospitalization fully (both small; hospitalization is the
+    # basis for the cheap patient-level screen below). ADT is loaded later,
+    # pushdown-filtered to screened patients' hospitalizations, so the full ADT
+    # table is never materialized in pandas (memory win at large sites).
     patient = Patient.from_file(
         data_directory=DATA_DIR,
         filetype=FILETYPE,
@@ -119,16 +122,52 @@ def _(Adt, DATA_DIR, FILETYPE, Hospitalization, Patient, TIMEZONE):
         timezone=TIMEZONE
     )
 
+    print(f"Patient: {len(patient.df):,} rows")
+    print(f"Hospitalization: {len(hospitalization.df):,} rows")
+    return hospitalization, patient
+
+
+@app.cell
+def _(hospitalization):
+    # Patient-level pre-screen (hospitalization table only — no ADT/labs load).
+    # Keep any patient with >=1 hospitalization that is an adult ED admission in
+    # the study window. This is a SUPERSET of the final cohort: block attributes
+    # (age, admission_type, admission year) all derive from a member
+    # hospitalization (see stitch_utils.build_block_hospitalization), so no
+    # eligible patient can be dropped here. Every real inclusion criterion is
+    # still applied per encounter block downstream.
+    _h = hospitalization.df
+    _screen = (
+        (_h["age_at_admission"] >= 18)
+        & (_h["admission_type_category"].str.lower() == "ed")
+        & (_h["admission_dttm"].dt.year >= 2018)
+        & (_h["admission_dttm"].dt.year <= 2024)
+    )
+    screened_patient_ids = _h.loc[_screen, "patient_id"].unique()
+    # ALL hospitalizations of screened patients (stitching needs each patient's
+    # full set — a non-ED hospitalization can stitch onto an ED one).
+    _member = _h[_h["patient_id"].isin(screened_patient_ids)]
+    screen_hosp_ids = _member["hospitalization_id"].astype(str).unique().tolist()
+
+    print(f"Screened patients: {len(screened_patient_ids):,}")
+    print(f"Screened hospitalizations (members): {len(screen_hosp_ids):,}")
+    return screen_hosp_ids, screened_patient_ids
+
+
+@app.cell
+def _(Adt, DATA_DIR, FILETYPE, TIMEZONE, screen_hosp_ids):
+    # ADT scoped to screened patients' hospitalizations via clifpy's pushdown
+    # filter (DuckDB reads only matching rows off disk). Same string-id filter
+    # pattern already used by su.materialize_stitched_tables.
     adt = Adt.from_file(
         data_directory=DATA_DIR,
         filetype=FILETYPE,
-        timezone=TIMEZONE
+        timezone=TIMEZONE,
+        filters={"hospitalization_id": screen_hosp_ids},
     )
 
-    print(f"Patient: {len(patient.df):,} rows")
-    print(f"Hospitalization: {len(hospitalization.df):,} rows")
-    print(f"ADT: {len(adt.df):,} rows")
-    return adt, hospitalization, patient
+    print(f"ADT (screened): {len(adt.df):,} rows")
+    return (adt,)
 
 
 @app.cell
@@ -146,10 +185,16 @@ def _(mo):
 
 
 @app.cell
-def _(PHI_DIR, STITCH_HOURS, adt, hospitalization, stitch_encounters, su):
-    # Stitch encounters on the FULL hospitalization + adt tables.
+def _(PHI_DIR, STITCH_HOURS, adt, hospitalization, screen_hosp_ids, stitch_encounters, su):
+    # Stitch on the SCREENED hospitalization + adt. Result is identical to
+    # full-population stitching for these patients: stitch_encounters partitions
+    # by patient_id, so dropping other patients cannot change a kept patient's
+    # encounter blocks.
+    _hosp_screened = hospitalization.df[
+        hospitalization.df["hospitalization_id"].astype(str).isin(set(screen_hosp_ids))
+    ]
     _hosp_stitched, _adt_stitched, encounter_mapping = stitch_encounters(
-        hospitalization.df,
+        _hosp_screened,
         adt.df,
         time_interval=STITCH_HOURS,
     )
@@ -393,6 +438,8 @@ def _(
     final_cohort,
     hospitalization,
     merged_df,
+    screen_hosp_ids,
+    screened_patient_ids,
     su,
 ):
     # Reverse lookup: stitched encounter id -> member hospitalization ids
@@ -421,6 +468,13 @@ def _(
             "all_hospitalizations", None,
             n_hosp=hospitalization.df["hospitalization_id"].nunique(),
             n_pat=hospitalization.df["patient_id"].nunique(),
+        ),
+        # Patient-level pre-screen (adult ED admission in-window). Reported on
+        # member hospitalizations / patients; block counting begins at stitch.
+        _row(
+            "patient_screen", None,
+            n_hosp=len(screen_hosp_ids),
+            n_pat=len(screened_patient_ids),
         ),
         _row("after_stitch_6h", block_hosp),
         _row("linked_to_adt", merged_df),
