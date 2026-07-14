@@ -22,7 +22,9 @@ uv run python Code/02_table1.py
 echo "--- 03_ase_visualizations.py ---"
 uv run python Code/03_ase_visualizations.py
 
-OUTPUT_DIR=$(uv run python -c 'import json; print(json.load(open("clif_config.json"))["output_directory"])')
+# Absolute path: quarto resolves --output-dir relative to the .qmd's directory
+# (Code/), so a relative path would land in Code/. abspath keeps it at root.
+OUTPUT_DIR=$(uv run python -c 'import json, os; print(os.path.abspath(json.load(open("clif_config.json"))["output_directory"]))')
 mkdir -p "$OUTPUT_DIR"
 
 echo "--- 04_ase_site_analysis_v9.qmd ---"
