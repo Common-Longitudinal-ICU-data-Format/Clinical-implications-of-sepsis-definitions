@@ -32,6 +32,9 @@ try {
     $config = Get-Content -Raw -Path "clif_config.json" | ConvertFrom-Json
     $outputDir = $config.output_directory
     New-Item -ItemType Directory -Force -Path $outputDir | Out-Null
+    # Absolute path: quarto resolves --output-dir relative to the .qmd's
+    # directory (Code/), so a relative path would land in Code/.
+    $outputDir = (Resolve-Path $outputDir).Path
 
     Write-Host "--- 04_ase_site_analysis_v9.qmd ---"
     quarto render Code/04_ase_site_analysis_v9.qmd --output-dir $outputDir
